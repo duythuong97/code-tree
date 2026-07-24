@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-tree-exporter"
+version = "0.2.0"
+description = "Extract configured source code into a canonical graph, file tree, and system tree"
+requires-python = ">=3.10"
+
+[project.scripts]
+code-tree-exporter = "cli:main"
+
+[tool.setuptools]
+py-modules = ["cli", "comments", "decoding", "env_loader", "graph_package", "pipeline", "renderers"]
+
+[tool.setuptools.packages.find]
+include = ["contract*", "extractors*"]
+
+[tool.setuptools.package-data]
+contract = ["*.json", "*.md", "json-schemas/*.json"]
+extractors = [
+  "angular-extractor/*.mjs",
+  "angular-extractor/*.json",
+  "dotnet-api-extractor/*.cs",
+  "dotnet-api-extractor/*.csproj",
+  "dotnet-batch-extractor/*.cs",
+  "dotnet-batch-extractor/*.csproj",
+  "_roslyn/*.cs",
+]

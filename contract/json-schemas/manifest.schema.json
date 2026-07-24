@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://code-map.local/schemas/csv-graph/manifest.schema.json",
+  "title": "Code Map CSV Package Manifest",
+  "$ref": "#/$defs/requirementManifestV1",
+  "$defs": {
+    "requirementManifestV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contractVersion", "extractor", "source", "generatedAt", "files", "statistics"],
+      "properties": {
+        "contractVersion": {"const": "1.0"},
+        "extractor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "version": {"type": "string", "minLength": 1}
+          }
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sourceKey", "repositoryKey"],
+          "properties": {
+            "sourceKey": {"type": "string", "minLength": 1},
+            "repositoryKey": {"type": "string", "minLength": 1},
+            "revision": {"type": "string"}
+          }
+        },
+        "generatedAt": {"type": "string", "format": "date-time"},
+        "files": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["nodes", "edges", "evidence", "issues"],
+          "properties": {
+            "nodes": {"const": "nodes.csv"},
+            "edges": {"const": "edges.csv"},
+            "evidence": {"const": "evidence.csv"},
+            "comments": {"const": "comments.csv"},
+            "issues": {"const": "issues.csv"},
+            "localized_texts": {"const": "localized_texts.csv"}
+          }
+        },
+        "statistics": {"$ref": "#/$defs/statistics"},
+        "checksums": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "nodes.csv": {"$ref": "#/$defs/file"},
+            "edges.csv": {"$ref": "#/$defs/file"},
+            "evidence.csv": {"$ref": "#/$defs/file"},
+            "comments.csv": {"$ref": "#/$defs/file"},
+            "issues.csv": {"$ref": "#/$defs/file"},
+            "localized_texts.csv": {"$ref": "#/$defs/file"}
+          }
+        },
+        "metadata": {"type": "object"}
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filesScanned", "nodes", "edges", "evidence", "issues"],
+      "properties": {
+        "filesScanned": {"type": "integer", "minimum": 0},
+        "nodes": {"type": "integer", "minimum": 0},
+        "edges": {"type": "integer", "minimum": 0},
+        "evidence": {"type": "integer", "minimum": 0},
+        "comments": {"type": "integer", "minimum": 0},
+        "issues": {"type": "integer", "minimum": 0},
+        "localized_texts": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

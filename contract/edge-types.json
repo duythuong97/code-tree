@@ -1,0 +1,29 @@
+{
+  "edge_types": {
+    "main": [
+      "CALLS_API", "STARTS", "CALLS", "READS", "REMOTE_READS", "INSERTS", "UPDATES",
+      "DELETES", "MERGES", "WRITES", "READS_COLUMN", "WRITES_COLUMN", "DERIVES_FROM",
+      "POPULATES", "TRIGGERS", "DEPENDS_ON", "USES"
+    ],
+    "structural_technical": [
+      "CONTAINS", "HANDLED_BY", "ENTRY_IN", "RESOLVES_TO", "NAVIGATES_TO",
+      "BELONGS_TO", "PROJECT_REFERENCE"
+    ]
+  },
+  "graph_layers": ["STRUCTURAL", "TECHNICAL", "DATA_FLOW"],
+  "producer_rules": {
+    "extractor_layers": ["STRUCTURAL", "TECHNICAL"],
+    "materializer_layers": ["DATA_FLOW"]
+  },
+  "expansion_semantics": {
+    "W": {
+      "terminal_edge_types": ["INSERTS", "UPDATES", "DELETES", "MERGES", "WRITES"],
+      "intermediate_edge_types": ["CALLS_API", "STARTS", "CALLS", "TRIGGERS", "HANDLED_BY", "ENTRY_IN", "RESOLVES_TO"]
+    },
+    "R": {
+      "terminal_edge_types": ["READS", "REMOTE_READS"],
+      "intermediate_edge_types": ["CALLS_API", "STARTS", "CALLS", "TRIGGERS", "HANDLED_BY", "ENTRY_IN", "RESOLVES_TO"]
+    }
+  },
+  "identity_fields": ["source_node_id", "edge_type", "target_node_id", "raw_operation", "graph_layer"]
+}

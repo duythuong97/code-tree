@@ -1,0 +1,43 @@
+{
+  "name": "code-map-demo",
+  "root": "${CODE_MAP_DEMO_ROOT}",
+  "output": "${CODE_TREE_OUTPUT}",
+  "inputData": "${CODE_MAP_INPUT_DATA}",
+  "defaultEncoding": "auto",
+  "sources": [
+    {
+      "name": "customer-web",
+      "type": "angular",
+      "folders": ["customer-web/src/app"],
+      "appConfig": "customer-web/src/assets/appconfig.json"
+    },
+    {
+      "name": "order-api",
+      "type": "dotnet-api",
+      "folders": ["order-api"],
+      "database": "ORDER_DB"
+    },
+    {
+      "name": "order-fulfillment",
+      "type": "dotnet-batch",
+      "folders": ["order-fulfillment"],
+      "database": "ORDER_DB"
+    },
+    {
+      "name": "order-db",
+      "type": "oracle-plsql",
+      "folders": ["order-db"],
+      "system": "order-db",
+      "database": "ORDER_DB",
+      "schema": "ORDER_APP",
+      "localRoutines": ["VALIDATE_LINES"]
+    },
+    {
+      "name": "order-ops",
+      "type": "sql-files",
+      "folders": ["order-ops"],
+      "system": "order-ops",
+      "database": "ORDER_DB"
+    }
+  ]
+}

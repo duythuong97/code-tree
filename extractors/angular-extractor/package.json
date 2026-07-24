@@ -1,0 +1,13 @@
+{
+  "name": "code-map-angular-extractor",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Angular CSV graph extractor using the TypeScript Compiler API.",
+  "peerDependencies": {
+    "typescript": ">=5.0.0"
+  },
+  "bin": {
+    "code-map-angular-extractor": "./main.mjs"
+  }
+}
