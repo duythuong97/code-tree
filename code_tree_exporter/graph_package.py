@@ -254,6 +254,8 @@ class GraphPackage:
             },
         }
         (output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_codebase_memory(self, output)
+        _write_knowledge(self, output)
 
     def _add_edge(self, source: str, target: str, edge_type: str, layer: str) -> None:
         edge_id = canonical_edge_id(source, edge_type, target, "", layer)
@@ -262,6 +264,88 @@ class GraphPackage:
             "edge_type": edge_type, "graph_layer": layer, "raw_operation": "",
             "confidence": "1.0", "properties_json": "{}",
         })
+
+
+def _write_codebase_memory(graph: GraphPackage, output: Path) -> None:
+    memory_dir = output / "codebase-memory"
+    entities_dir = memory_dir / "entities"
+    relationships_dir = memory_dir / "relationships"
+    summaries_dir = memory_dir / "summaries"
+    for d in (entities_dir, relationships_dir, summaries_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    entities_file = entities_dir / "nodes.jsonl"
+    with entities_file.open("w", encoding="utf-8") as f:
+        for node_id, node in graph.nodes.items():
+            record = {
+                "memory_id": f"mem:node:{node_id}",
+                "node_id": node_id,
+                "kind": node.get("node_type", ""),
+                "source": node.get("repository_key", ""),
+                "qualified_name": node.get("qualified_name", ""),
+                "display_name": node.get("default_display_name", ""),
+                "summary": "",
+                "evidence_ids": [],
+                "related_node_ids": [],
+                "issue_ids": [],
+                "knowledge_refs": [],
+                "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "content_hash": hashlib.sha256(json.dumps(node, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    rels_file = relationships_dir / "edges.jsonl"
+    with rels_file.open("w", encoding="utf-8") as f:
+        for edge_id, edge in graph.edges.items():
+            record = {
+                "memory_id": f"mem:edge:{edge_id}",
+                "edge_ids": [edge_id],
+                "kind": edge.get("edge_type", ""),
+                "from_node_id": edge.get("source_node_id", ""),
+                "to_node_id": edge.get("target_node_id", ""),
+                "path_node_ids": [],
+                "summary": "",
+                "confidence": edge.get("confidence", "1.0"),
+                "evidence_ids": [],
+                "issue_ids": []
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    manifest = {
+        "version": "1.0",
+        "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "files": {
+            "entities": ["entities/nodes.jsonl"],
+            "relationships": ["relationships/edges.jsonl"],
+            "summaries": []
+        }
+    }
+    (memory_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_knowledge(graph: GraphPackage, output: Path) -> None:
+    knowledge_dir = output / "knowledge"
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+
+    apis_file = knowledge_dir / "APIs.md"
+    with apis_file.open("w", encoding="utf-8") as f:
+        f.write("# APIs\n\n")
+        for node_id, node in graph.nodes.items():
+            if node.get("node_type") == "API_OPERATION":
+                f.write(f"## {node.get('default_display_name', '')}\n\n")
+                f.write("```yaml\n")
+                f.write(f"node_id: {node_id}\n")
+                f.write(f"source: {node.get('repository_key', '')}\n")
+                f.write(f"kind: {node.get('node_type', '')}\n")
+                f.write("```\n\n")
+                f.write(f"Qualified name: `{node.get('qualified_name', '')}`\n\n")
+
+    manifest = {
+        "version": "1.0",
+        "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "files": ["APIs.md"]
+    }
+    (knowledge_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def replace_directory(staging: Path, output: Path) -> None:
