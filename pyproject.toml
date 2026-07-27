@@ -7,24 +7,32 @@ name = "code-tree-exporter"
 version = "0.2.0"
 description = "Extract configured source code into a canonical graph, file tree, and system tree"
 requires-python = ">=3.10"
+dependencies = ["antlr4-python3-runtime==4.13.2"]
 
 [project.scripts]
-code-tree-exporter = "cli:main"
-
-[tool.setuptools]
-py-modules = ["cli", "comments", "decoding", "env_loader", "graph_package", "pipeline", "renderers"]
+code-tree-exporter = "code_tree_exporter.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["contract*", "extractors*"]
+include = ["code_tree_exporter*"]
+namespaces = false
 
 [tool.setuptools.package-data]
-contract = ["*.json", "*.md", "json-schemas/*.json"]
-extractors = [
-  "angular-extractor/*.mjs",
-  "angular-extractor/*.json",
-  "dotnet-api-extractor/*.cs",
-  "dotnet-api-extractor/*.csproj",
-  "dotnet-batch-extractor/*.cs",
-  "dotnet-batch-extractor/*.csproj",
-  "_roslyn/*.cs",
+code_tree_exporter = [
+  "contract/*.json",
+  "contract/*.md",
+  "contract/json-schemas/*.json",
+  "extractors/angular-extractor/main.mjs",
+  "extractors/angular-extractor/main.py",
+  "extractors/angular-extractor/package.json",
+  "extractors/dotnet-api-extractor/main.py",
+  "extractors/dotnet-api-extractor/Program.cs",
+  "extractors/dotnet-api-extractor/*.csproj",
+  "extractors/dotnet-batch-extractor/main.py",
+  "extractors/dotnet-batch-extractor/Program.cs",
+  "extractors/dotnet-batch-extractor/*.csproj",
+  "extractors/plsql-extractor/main.py",
+  "extractors/sql-file-extractor/main.py",
+  "extractors/_roslyn/*.cs",
+  "extractors/package_support/antlr_plsql_generated/*.md",
+  "extractors/package_support/antlr_plsql_generated/LICENSE",
 ]

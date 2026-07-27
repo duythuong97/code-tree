@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://code-tree-exporter.local/semantic-tree.schema.json",
+  "title": "Semantic behavior tree V3",
+  "type": "object",
+  "required": ["version", "type", "label", "parameters", "steps", "analysis_notes"],
+  "properties": {
+    "version": { "const": 3 },
+    "type": { "const": "operation" },
+    "label": { "type": "string" },
+    "summary": { "type": "string" },
+    "parameters": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/parameter" }
+    },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fact" }
+    },
+    "analysis_notes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fact" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": ["path", "line"],
+      "properties": {
+        "path": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "parameter": {
+      "type": "object",
+      "required": ["name", "type"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string" },
+        "direction": { "enum": ["IN", "OUT", "IN OUT", "REF", "PARAMS"] },
+        "default": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "fact": {
+      "type": "object",
+      "required": ["type", "source"],
+      "properties": {
+        "type": { "type": "string", "minLength": 1 },
+        "label": { "type": "string" },
+        "source": { "$ref": "#/$defs/source" },
+        "condition": { "type": "string" },
+        "iterator": { "type": "string" },
+        "expression": { "type": "string" },
+        "target": { "type": "string" },
+        "action": { "type": "string" },
+        "ref_node_id": { "type": "string" },
+        "resolution": { "enum": ["resolved", "unresolved", "partial"] },
+        "result": { "type": "string" },
+        "awaited": { "type": "boolean" },
+        "arguments": { "type": "array", "items": { "type": "string" } },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/fact" } },
+        "else_steps": { "type": "array", "items": { "$ref": "#/$defs/fact" } },
+        "initialization_steps": { "type": "array", "items": { "$ref": "#/$defs/fact" } },
+        "condition_steps": { "type": "array", "items": { "$ref": "#/$defs/fact" } },
+        "increment_steps": { "type": "array", "items": { "$ref": "#/$defs/fact" } },
+        "catches": { "type": "array", "items": { "$ref": "#/$defs/fact" } },
+        "finally_steps": { "type": "array", "items": { "$ref": "#/$defs/fact" } },
+        "cases": { "type": "array", "items": { "$ref": "#/$defs/fact" } },
+        "effects": { "type": "array", "items": { "$ref": "#/$defs/fact" } },
+        "code": { "type": "string" },
+        "severity": { "enum": ["INFO", "WARNING", "ERROR"] }
+      },
+      "additionalProperties": true
+    }
+  }
+}

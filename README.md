@@ -58,6 +58,14 @@ Sao chép `.env.example` thành `.env` trên mỗi máy rồi sửa path. CLI t�
 
 `defaultEncoding: "auto"` nhận diện theo thứ tự: BOM, khai báo `coding`/`charset`/`encoding` trong file, UTF-8 strict, UTF-16 heuristic, rồi CP932/EUC-JP strict. Kết quả legacy mơ hồ tạo `ENCODING_CONFLICT`; không dùng ký tự replacement nên không âm thầm làm hỏng tiếng Nhật. `encoding` và `encodingOverrides` vẫn dùng để khóa encoding cho source/file đặc biệt.
 
+## Cài đặt
+
+- macOS: `python3 -m pip install -r requirements.txt`
+- Windows: `py -m pip install -r requirements.txt`
+- Cài CLI từ source: `python3 -m pip install .` hoặc `py -m pip install .`
+
+Node.js + TypeScript và .NET SDK 9 là runtime ngoài Python; chỉ cần cài khi config dùng Angular hoặc .NET.
+
 ## Chạy
 
 Sau khi cài package, cả macOS và Windows:
@@ -66,9 +74,21 @@ Sau khi cài package, cả macOS và Windows:
 code-tree-exporter --config <absolute-config-path>
 ```
 
-macOS chưa cài package: `python3 -m cli --config /path/extractor-config.json`.
+Chạy trực tiếp từ source:
 
-Windows chưa cài package: `py -m cli --config C:\\path\\extractor-config.json`.
+- macOS: `python3 -m code_tree_exporter --config /path/extractor-config.json`
+- Windows: `py -m code_tree_exporter --config C:\\path\\extractor-config.json`
+
+`python -m cli` vẫn được giữ làm lệnh tương thích.
+
+## Cấu trúc source
+
+```text
+code_tree_exporter/     # package, contract, extractor runtimes
+scripts/                # tiện ích repository, không cài thành CLI
+cli.py                  # compatibility shim
+pyproject.toml          # build, dependency, package resources
+```
 
 ## Output
 
