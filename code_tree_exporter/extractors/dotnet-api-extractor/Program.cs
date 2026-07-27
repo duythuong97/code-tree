@@ -19,6 +19,7 @@ var root = ExtractorRuntime.ConfigPath(config, "root");
 var output = ExtractorRuntime.ConfigPath(config, "output");
 var inputRoot = ExtractorRuntime.ConfigPath(config, "inputData");
 var catalog = Catalog.Load(inputRoot, database);
+var mapperQueries = StringArray(config, "xmlMapperQueries").ToHashSet(StringComparer.Ordinal);
 var files = ExpandWorkspaceFiles(ExtractorRuntime.ConfiguredFiles(config, new[] { ".cs", ".csproj", ".sln" }), root);
 var csFiles = files.Where(file => file.SyntaxTree is not null).ToList();
 
@@ -85,8 +86,9 @@ foreach (var file in csFiles)
         .ToHashSet(StringComparer.Ordinal);
     invocationEdges.AddRange(ExtractorRuntime.InvocationEdges(file, model, visibleClassNames));
 }
+var mapperReferences = FindMapperReferences(csFiles, compilationByTree, projects, mapperQueries);
 
-var dataAccessClasses = new HashSet<string>(StringComparer.Ordinal);
+var dataAccessClasses = mapperReferences.Select(reference => reference.OwnerClass).ToHashSet(StringComparer.Ordinal);
 foreach (var file in csFiles)
 {
     var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
@@ -112,6 +114,7 @@ foreach (var endpoint in endpoints.Where(endpoint => endpoint.IsMinimal && endpo
     foreach (var target in classCallEdges.Where(edge => edge.Call.File.RelativePath == endpoint.File!.RelativePath && edge.Call.Start >= endpoint.HandlerStart && edge.Call.Start < endpoint.HandlerEnd).Select(edge => edge.Target).Where(identity => !string.IsNullOrEmpty(identity)))
         reachabilityRoots.Add(target);
 var reachableClasses = ReachableClasses(reachabilityRoots, classCallEdges.Select(edge => (edge.Source, edge.Target)), classesByIdentity.Keys.ToHashSet(StringComparer.Ordinal));
+reachableClasses.UnionWith(mapperReferences.Select(reference => reference.OwnerClass));
 var controllerIds = endpointControllerKeys.ToDictionary(identity => identity, identity => ExtractorRuntime.StableNodeId("controller", application, identity), StringComparer.Ordinal);
 var serviceIds = reachableClasses
     .Where(identity => classesByIdentity.TryGetValue(identity, out var cls) && cls.Name.EndsWith("Service", StringComparison.Ordinal))
@@ -154,6 +157,15 @@ foreach (var file in csFiles)
         var end = ExtractorRuntime.LineForOffset(file, method.Span.End);
         builder.AddEvidence("NODE", methodId, file.RelativePath, start, end, "DECLARATION", ExtractorRuntime.LineText(file, start));
     }
+}
+
+foreach (var reference in mapperReferences)
+{
+    if (!methodNodeIdsByDeclaration.TryGetValue((reference.File.SyntaxTree!, reference.OwnerMethodStart), out var ownerMethodId)) continue;
+    var mapperNodeId = ExtractorRuntime.StableNodeId("inline-sql", repository, reference.QueryId);
+    var edgeId = builder.AddEdge(ownerMethodId, mapperNodeId, "CALLS", rawOperation: reference.QueryId);
+    var line = ExtractorRuntime.LineForOffset(reference.File, reference.Start);
+    builder.AddEvidence("EDGE", edgeId, reference.File.RelativePath, line, line, "XML_MAPPER_REFERENCE", ExtractorRuntime.LineText(reference.File, line));
 }
 
 foreach (var endpoint in endpoints)
@@ -258,6 +270,31 @@ static string? TargetMethodNodeId(InvocationInfo invocation, CSharpCompilation c
     var candidates = info.CandidateSymbols.OfType<IMethodSymbol>().ToArray();
     var symbol = info.Symbol as IMethodSymbol ?? (candidates.Length == 1 ? candidates[0] : null);
     return symbol?.DeclaringSyntaxReferences.Select(reference => methodNodeIds.GetValueOrDefault((reference.SyntaxTree, reference.Span.Start))).FirstOrDefault(id => !string.IsNullOrWhiteSpace(id));
+}
+
+static List<MapperReference> FindMapperReferences(IEnumerable<SourceFile> files, IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilations, List<ProjectInfo> projects, ISet<string> knownQueries)
+{
+    var result = new List<MapperReference>();
+    if (knownQueries.Count == 0) return result;
+    foreach (var file in files.Where(file => file.SyntaxTree is not null))
+    {
+        var model = compilations[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
+        foreach (var invocation in file.SyntaxTree!.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
+        {
+            var argument = invocation.ArgumentList.Arguments.FirstOrDefault()?.Expression;
+            if (argument is null) continue;
+            var queryId = model.GetConstantValue(argument) is { HasValue: true, Value: string value }
+                ? value
+                : argument is LiteralExpressionSyntax literal && literal.IsKind(SyntaxKind.StringLiteralExpression) ? literal.Token.ValueText : "";
+            if (!knownQueries.Contains(queryId)) continue;
+            var method = invocation.Ancestors().OfType<MethodDeclarationSyntax>().FirstOrDefault();
+            var owner = method?.Ancestors().OfType<ClassDeclarationSyntax>().FirstOrDefault();
+            if (method is null || owner is null) continue;
+            var identity = ScopedClassIdentity(TypeIdentity(model.GetDeclaredSymbol(owner)), file, ProjectForFile(file, projects));
+            result.Add(new MapperReference(identity, method.SpanStart, queryId, invocation.SpanStart, file));
+        }
+    }
+    return result;
 }
 
 static void AttachApiSemanticTrees(PackageBuilder builder, IEnumerable<EndpointInfo> endpoints, IReadOnlyCollection<SourceFile> files, IReadOnlyDictionary<(SyntaxTree Tree, int Start), string> methodNodeIds, string application, List<ProjectInfo> projects, IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilationByTree)
@@ -682,6 +719,13 @@ static bool HasDynamicSqlTarget(string text)
     return Regex.IsMatch(text, @"\b(?:FROM|JOIN|INTO|UPDATE|MERGE\s+INTO)\s+(?:[A-Za-z_][\w$#]*\s*\.\s*)?\{", RegexOptions.IgnoreCase);
 }
 
+static IEnumerable<string> StringArray(JsonElement config, string name)
+{
+    if (!config.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Array) yield break;
+    foreach (var item in value.EnumerateArray())
+        if (item.ValueKind == JsonValueKind.String && item.GetString() is { Length: > 0 } text) yield return text;
+}
+
 static class Args
 {
     public static string? Value(string[] args, string name)
@@ -691,5 +735,6 @@ static class Args
     }
 }
 
+sealed record MapperReference(string OwnerClass, int OwnerMethodStart, string QueryId, int Start, SourceFile File);
 sealed record SolutionInfo(string Id, string RelativePath, string Directory, string Text);
 sealed record ProjectInfo(string Id, string RelativePath, string Directory, List<SourceFile> SourceFiles, List<string> ProjectReferences);

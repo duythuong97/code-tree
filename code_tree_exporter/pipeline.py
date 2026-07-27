@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
+from xml.etree import ElementTree
 
 from .comments import extract_comments
 from .contract.graph_contract import normalize_repository_path
 from .decoding import SourceDecodingError, decode_source, encoding_for
 from .env_loader import load_dotenv
 from .extractors import ExtractorSpec, extractor_spec
-from .graph_package import GraphPackage, SourceRecord, replace_directory
+from .graph_package import (
+    GraphPackage,
+    SourceRecord,
+    replace_directory,
+    validate_output_directory,
+)
 from .renderers import render_file_tree, render_system_tree
 
 _BLOCKED_DIRECTORIES = frozenset(
@@ -48,6 +55,12 @@ def run_pipeline(config_path: Path) -> Path:
     sources = config.get("sources")
     if not isinstance(sources, list) or not sources:
         raise ValueError("sources must be a non-empty array")
+    validated_sources = [_validate_source(source, index) for index, source in enumerate(sources)]
+    source_names = [str(source["name"]) for source in validated_sources]
+    if len(source_names) != len(set(source_names)):
+        raise ValueError("sources[].name must be unique")
+    _validate_data_paths(config, validated_sources, output)
+    validate_output_directory(output)
     default_encoding = str(config.get("defaultEncoding", "auto"))
     graph = GraphPackage()
     staging_parent = output.parent
@@ -61,8 +74,7 @@ def run_pipeline(config_path: Path) -> Path:
         prepared_root = temporary_root / "sources"
         packages_root.mkdir()
         prepared_root.mkdir()
-        for index, raw_source in enumerate(sources):
-            source = _validate_source(raw_source, index)
+        for source in validated_sources:
             source_type = str(source["type"])
             spec = extractor_spec(source_type)
             source_name = str(source["name"])
@@ -94,24 +106,46 @@ def run_pipeline(config_path: Path) -> Path:
                 json.dumps(extractor_config, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            api_operations_before = sum(
+                node.get("node_type") == "API_OPERATION" for node in graph.nodes.values()
+            )
             _run_extractor(spec, extractor_config_path, extractor_config, graph)
             if package_output.exists():
                 graph.merge_directory(package_output)
+            if (
+                spec.config_type == "dotnet-api"
+                and any(Path(path).suffix.lower() == ".cs" for path in valid_paths)
+                and sum(node.get("node_type") == "API_OPERATION" for node in graph.nodes.values())
+                == api_operations_before
+            ):
+                graph.add_issue(
+                    "NO_API_ENDPOINTS",
+                    "C# parsed; no supported ASP.NET controller or minimal API endpoint recognized",
+                    severity="WARNING",
+                    source_path=next(path for path in valid_paths if Path(path).suffix.lower() == ".cs"),
+                )
+            if spec.config_type in {"dotnet-api", "dotnet-batch"}:
+                _run_dotnet_xml_companion(
+                    extractor_config,
+                    packages_root / f"{source_name}-xml",
+                    valid_paths,
+                    graph,
+                )
 
         graph.resolve_routine_references()
         graph.materialize_structure()
-        final_staging = output.with_name(output.name + ".new")
-        if final_staging.exists():
-            shutil.rmtree(final_staging)
-        final_staging.mkdir(parents=True)
+        final_staging = temporary_root / "final"
+        final_staging.mkdir()
+        max_tree_lines = _positive_int(config, "maxTreeLines", 20_000, minimum=10)
         graph.write(
             final_staging,
             source_name=str(config.get("name") or root.name),
             config_path=str(config_path),
-            max_csv_rows=int(config.get("maxCsvRows", 1_000_000)),
+            max_csv_rows=_positive_int(config, "maxCsvRows", 1_000_000),
+            max_csv_bytes=_positive_int(config, "maxCsvBytes", 8 * 1024 * 1024, minimum=1024),
         )
-        render_file_tree(graph, final_staging / "file-trees")
-        render_system_tree(graph, final_staging / "SYSTEM_TREE.md")
+        render_file_tree(graph, final_staging / "file-trees", max_tree_lines)
+        render_system_tree(graph, final_staging / "SYSTEM_TREE.md", max_tree_lines)
         replace_directory(final_staging, output)
     return output
 
@@ -152,6 +186,30 @@ def _absolute_path(config: dict, key: str) -> Path:
     return path.resolve()
 
 
+def _positive_int(config: dict, key: str, default: int, *, minimum: int = 1) -> int:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer >= {minimum}")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer >= {minimum}") from exc
+    if result < minimum:
+        raise ValueError(f"{key} must be an integer >= {minimum}")
+    return result
+
+def _validate_data_paths(config: dict, sources: list[dict], output: Path) -> None:
+    output = output.resolve()
+    managed_paths = (output, output.with_name(output.name + ".previous"))
+    owners = [(config, "inputData"), *((source, f"sources[{index}].inputData") for index, source in enumerate(sources))]
+    for owner, label in owners:
+        value = owner.get("inputData")
+        if not isinstance(value, str) or not value:
+            continue
+        candidate = Path(value).resolve()
+        if any(candidate == managed or managed in candidate.parents for managed in managed_paths):
+            raise ValueError(f"{label} must be outside output and output.previous: {candidate}")
+
 def _validate_source(value: object, index: int) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"sources[{index}] must be an object")
@@ -177,6 +235,8 @@ def _prepare_source(
     graph: GraphPackage,
 ) -> tuple[list[SourceRecord], list[str]]:
     selected = _selected_files(root, source["folders"], spec.suffixes)
+    if spec.config_type in {"dotnet-api", "dotnet-batch"}:
+        selected = _expand_dotnet_selection(root, selected)
     records: list[SourceRecord] = []
     valid_paths: list[str] = []
     preserve_comments = source.get("preserveComments", True) is not False
@@ -253,18 +313,99 @@ def _selected_files(root: Path, folders: list, suffixes: tuple[str, ...]) -> lis
     return sorted(result, key=lambda path: path.relative_to(root).as_posix())
 
 
+def _expand_dotnet_selection(root: Path, selected: list[Path]) -> list[Path]:
+    result = set(selected)
+    projects: list[Path] = [path for path in selected if path.suffix.lower() == ".csproj"]
+    seen_projects: set[Path] = set()
+    for solution in (path for path in selected if path.suffix.lower() == ".sln"):
+        for match in re.finditer(r'Project\([^)]*\)\s*=\s*"[^"\r\n]+"\s*,\s*"(?P<path>[^"\r\n]+\.csproj)"', solution.read_text(encoding="utf-8"), re.IGNORECASE):
+            projects.append((solution.parent / match.group("path").replace("\\", "/")).resolve())
+    while projects:
+        project = projects.pop()
+        if project in seen_projects or not _safe_source_file(project, root, {".csproj"}):
+            continue
+        seen_projects.add(project)
+        result.add(project)
+        for path in project.parent.rglob("*"):
+            if _safe_source_file(path, root, {".cs", ".xml"}):
+                result.add(path)
+        try:
+            project_xml = ElementTree.fromstring(project.read_text(encoding="utf-8"))
+        except (OSError, ElementTree.ParseError, UnicodeDecodeError):
+            continue
+        for element in project_xml.iter():
+            tag = element.tag.rsplit("}", 1)[-1]
+            include = element.get("Include", "").strip()
+            if not include or tag not in {"Compile", "ProjectReference"}:
+                continue
+            candidate = (project.parent / include.replace("\\", "/")).resolve()
+            if tag == "ProjectReference":
+                projects.append(candidate)
+            elif _safe_source_file(candidate, root, {".cs"}):
+                result.add(candidate)
+    return sorted(result, key=lambda path: path.relative_to(root).as_posix())
+
+def _safe_source_file(path: Path, root: Path, suffixes: set[str]) -> bool:
+    resolved = path.resolve()
+    return (
+        resolved.is_file()
+        and (resolved == root or root in resolved.parents)
+        and resolved.suffix.lower() in suffixes
+        and not (_BLOCKED_DIRECTORIES & {part.lower() for part in resolved.relative_to(root).parts})
+    )
+
 def _copy_angular_metadata(root: Path, staging: Path, source: dict) -> None:
-    configured = {"angular.json", "tsconfig.json", "tsconfig.app.json"}
+    root = root.resolve()
+    pending: list[Path] = []
+    for raw in source["folders"]:
+        relative = raw.get("path", ".") if isinstance(raw, dict) else raw
+        candidate = (root / str(relative)).resolve()
+        current = candidate.parent if candidate.is_file() else candidate
+        while current == root or root in current.parents:
+            angular_json = current / "angular.json"
+            if angular_json.is_file():
+                pending.extend((angular_json, current / "tsconfig.json", current / "tsconfig.app.json"))
+                try:
+                    workspace = json.loads(angular_json.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    workspace = {}
+                projects = workspace.get("projects", {}) if isinstance(workspace, dict) else {}
+                for project in projects.values() if isinstance(projects, dict) else ():
+                    if not isinstance(project, dict):
+                        continue
+                    targets = project.get("architect") or project.get("targets") or {}
+                    for target in targets.values() if isinstance(targets, dict) else ():
+                        options = target.get("options", {}) if isinstance(target, dict) else {}
+                        tsconfig = options.get("tsConfig") if isinstance(options, dict) else None
+                        if isinstance(tsconfig, str):
+                            pending.append((current / tsconfig).resolve())
+                break
+            if current == root:
+                break
+            current = current.parent
     for key in ("appConfig", "tsconfig", "tsConfig"):
         value = source.get(key)
         if isinstance(value, str) and value:
-            configured.add(value)
-    for relative in configured:
-        candidate = (root / relative).resolve()
-        if candidate.is_file() and (candidate == root or root in candidate.parents):
-            destination = staging / candidate.relative_to(root)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(candidate, destination)
+            pending.append((root / value).resolve())
+
+    copied: set[Path] = set()
+    while pending:
+        candidate = pending.pop().resolve()
+        if candidate in copied or not candidate.is_file() or not (candidate == root or root in candidate.parents):
+            continue
+        copied.add(candidate)
+        destination = staging / candidate.relative_to(root)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(candidate, destination)
+        if candidate.name.startswith("tsconfig") and candidate.suffix.lower() == ".json":
+            try:
+                metadata = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            extends = metadata.get("extends") if isinstance(metadata, dict) else None
+            if isinstance(extends, str) and (extends.startswith(".") or Path(extends).is_absolute()):
+                parent = (candidate.parent / extends).resolve()
+                pending.append(parent if parent.suffix else parent.with_suffix(".json"))
 
 
 def _extractor_config(
@@ -302,6 +443,8 @@ def _extractor_config(
     if spec.config_type == "angular":
         result.setdefault("appConfig", "")
         result["_typescriptPath"] = _typescript_path(Path(global_config["root"]))
+    if spec.config_type in {"dotnet-api", "dotnet-batch"}:
+        result["xmlMapperQueries"] = _xml_mapper_queries(staging_root, valid_paths)
     return result
 
 
@@ -313,6 +456,73 @@ def _staged_folders(folders: list) -> list:
         else:
             result.append(item)
     return result
+
+
+def _run_dotnet_xml_companion(
+    dotnet_config: dict,
+    output: Path,
+    valid_paths: list[str],
+    graph: GraphPackage,
+) -> None:
+    root = Path(dotnet_config["root"])
+    xml_paths = [
+        path
+        for path in valid_paths
+        if Path(path).suffix.lower() == ".xml" and _is_sql_mapper(root / path)
+    ]
+    if not xml_paths:
+        return
+    from .extractors.xml_sql.runner import extract
+
+    xml_config = {
+        **dotnet_config,
+        "type": "xml-sql",
+        "output": str(output.resolve()),
+        "folders": xml_paths,
+        "files": xml_paths,
+    }
+    extract(xml_config)
+    graph.merge_directory(output)
+
+def _is_sql_mapper(path: Path) -> bool:
+    try:
+        root = ElementTree.parse(path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return False
+    return (
+        root.tag.rsplit("}", 1)[-1].lower() == "mapper"
+        and bool(root.get("namespace", "").strip())
+        and any(
+            element.tag.rsplit("}", 1)[-1].lower()
+            in {"select", "insert", "update", "delete", "merge", "statement"}
+            for element in root.iter()
+        )
+    )
+
+
+def _xml_mapper_queries(root: Path, paths: list[str]) -> list[str]:
+    queries: set[str] = set()
+    statement_tags = {"select", "insert", "update", "delete", "merge", "statement"}
+    for relative in paths:
+        path = root / relative
+        if path.suffix.lower() != ".xml":
+            continue
+        try:
+            mapper = ElementTree.parse(path).getroot()
+        except (OSError, ElementTree.ParseError):
+            continue
+        if mapper.tag.rsplit("}", 1)[-1].lower() != "mapper":
+            continue
+        namespace = mapper.get("namespace", "").strip()
+        if not namespace:
+            continue
+        for statement in mapper.iter():
+            if statement.tag.rsplit("}", 1)[-1].lower() not in statement_tags:
+                continue
+            statement_id = statement.get("id", "").strip()
+            if statement_id:
+                queries.add(f"{namespace}.{statement_id}")
+    return sorted(queries)
 
 
 def _run_extractor(
@@ -345,6 +555,12 @@ def _run_extractor(
             return
         completed = subprocess.CompletedProcess(command, 127, "", str(exc))
     if completed.returncode and spec.config_type == "angular":
+        primary_message = (completed.stderr or completed.stdout or "Angular TypeScript parser failed").strip()
+        graph.add_issue(
+            "SEMANTIC_TREE_UNAVAILABLE",
+            f"Angular TypeScript parser unavailable; degraded regex fallback used: {primary_message}",
+            severity="WARNING",
+        )
         fallback = spec.script.with_name("main.py")
         completed = subprocess.run(
             [sys.executable, str(fallback), "--config", str(config_path)],
@@ -369,10 +585,7 @@ def _typescript_path(root: Path) -> str:
         / "typescript",
     ]
     candidates.extend(
-        path.parent for path in root.glob("*/node_modules/typescript/package.json")
-    )
-    candidates.extend(
-        path.parent for path in root.glob("*/*/node_modules/typescript/package.json")
+        path.parent for path in root.glob("**/node_modules/typescript/package.json")
     )
     for candidate in candidates:
         if candidate.exists():

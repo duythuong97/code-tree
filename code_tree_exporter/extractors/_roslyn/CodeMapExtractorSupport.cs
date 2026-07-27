@@ -72,8 +72,12 @@ public static class ExtractorRuntime
         {
             var absoluteFolder = Path.GetFullPath(Path.Combine(root, NativePath(folder)));
             if (!IsWithin(absoluteFolder, root)) throw new ArgumentException($"Folder escapes root: {folder}");
-            if (!Directory.Exists(absoluteFolder)) continue;
-            foreach (var path in Directory.EnumerateFiles(absoluteFolder, "*", SearchOption.AllDirectories).OrderBy(p => p, PathComparer))
+            var candidates = File.Exists(absoluteFolder)
+                ? new[] { absoluteFolder }
+                : Directory.Exists(absoluteFolder)
+                    ? Directory.EnumerateFiles(absoluteFolder, "*", SearchOption.AllDirectories).OrderBy(p => p, PathComparer)
+                    : Enumerable.Empty<string>();
+            foreach (var path in candidates)
             {
                 if (!IsWithin(path, root)) throw new ArgumentException($"Source file escapes root: {path}");
                 if (!seen.Add(path)) continue;

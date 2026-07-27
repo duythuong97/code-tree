@@ -531,20 +531,35 @@ function configuredFiles(config, extensions, discovery = discoverAngularProject(
   return result;
 }
 
+function nearestAngularJson(root, folders) {
+  const candidates = [...(folders || []).map(value => path.resolve(root, typeof value === 'object' ? value.path || '.' : value || '.')), root];
+  for (const candidate of candidates) {
+    let current = existsSync(candidate) && statSync(candidate).isFile() ? path.dirname(candidate) : candidate;
+    while (current === root || current.startsWith(root + path.sep)) {
+      const angularJson = path.join(current, 'angular.json');
+      if (existsSync(angularJson)) return angularJson;
+      if (current === root) break;
+      current = path.dirname(current);
+    }
+  }
+  return path.join(root, 'angular.json');
+}
+
 function discoverAngularProject(config) {
   const root = path.resolve(config.root);
-  const angularJsonPath = path.join(root, 'angular.json');
+  const angularJsonPath = nearestAngularJson(root, config.folders);
   const angularJson = readJsonIfExists(angularJsonPath) || {};
   const projectName = angularProjectName(angularJson, config);
   const project = projectName ? angularJson.projects?.[projectName] || {} : {};
-  const tsconfigPath = angularTsconfigPath(config, root, project);
+  const workspaceRoot = existsSync(angularJsonPath) ? path.dirname(angularJsonPath) : root;
+  const tsconfigPath = angularTsconfigPath(config, root, workspaceRoot, project);
   const tsconfig = readJsonIfExists(tsconfigPath) || {};
   return {
     root,
     angularJsonPath: existsSync(angularJsonPath) ? angularJsonPath : '',
     angularProjectName: projectName,
     tsconfigPath: tsconfigPath && existsSync(tsconfigPath) ? tsconfigPath : '',
-    folders: scanFolders(config, root, project),
+    folders: scanFolders(config, root, workspaceRoot, project),
     exclusions: scanExclusions(config, tsconfig),
   };
 }
@@ -566,24 +581,25 @@ function angularProjectName(angularJson, config) {
   return Object.keys(projects)[0] || '';
 }
 
-function angularTsconfigPath(config, root, project) {
+function angularTsconfigPath(config, root, workspaceRoot, project) {
   const configured = config.tsconfig || config.tsConfig;
   if (configured) return path.resolve(root, configured);
   const options = project?.architect?.build?.options || project?.targets?.build?.options || {};
-  if (options.tsConfig) return path.resolve(root, options.tsConfig);
+  if (options.tsConfig) return path.resolve(workspaceRoot, options.tsConfig);
   for (const candidate of ['tsconfig.app.json', 'tsconfig.json']) {
-    const absolute = path.join(root, candidate);
+    const absolute = path.join(workspaceRoot, candidate);
     if (existsSync(absolute)) return absolute;
   }
   return '';
 }
 
-function scanFolders(config, root, project) {
+function scanFolders(config, root, workspaceRoot, project) {
   const configured = Array.isArray(config.folders) ? config.folders : [];
   const values = configured.map(item => (typeof item === 'string' ? item : item?.path || '')).filter(Boolean);
   if (values.length) return unique(values.map(value => repoPath(value)));
+  const workspacePrefix = repoPath(path.relative(root, workspaceRoot));
   const sourceRoot = project?.sourceRoot || (project?.root ? path.posix.join(repoPath(project.root), 'src') : 'src');
-  const fallback = path.posix.join(repoPath(sourceRoot), 'app');
+  const fallback = path.posix.join(workspacePrefix, repoPath(sourceRoot), 'app');
   return [existsSync(path.resolve(root, fallback)) ? fallback : '.'];
 }
 
@@ -1331,9 +1347,13 @@ function pushMap(map, key, value) {
   map.get(key).push(value);
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(error instanceof Error ? error.stack || error.message : String(error));
-  process.exit(1);
+export { discoverAngularProject };
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error instanceof Error ? error.stack || error.message : String(error));
+    process.exit(1);
+  }
 }

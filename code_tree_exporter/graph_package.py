@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import shutil
 from dataclasses import dataclass, field
@@ -47,18 +48,28 @@ class GraphPackage:
     conflicts: list[tuple[str, str]] = field(default_factory=list)
 
     def merge_directory(self, package_dir: Path) -> None:
-        for name in ("nodes", "edges", "evidence", "issues"):
-            path = package_dir / f"{name}.csv"
-            if not path.exists():
-                continue
-            with path.open(encoding="utf-8", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    key = row[CSV_HEADERS[name][0]]
-                    current = getattr(self, name).get(key)
-                    if current is not None and current != row:
-                        self.conflicts.append((name, key))
-                        continue
-                    getattr(self, name)[key] = row
+        try:
+            manifest = json.loads((package_dir / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        manifest_files = manifest.get("files", {}) if isinstance(manifest, dict) else {}
+        for name in CSV_HEADERS:
+            configured = manifest_files.get(name, f"{name}.csv") if isinstance(manifest_files, dict) else f"{name}.csv"
+            filenames = configured if isinstance(configured, list) else [configured]
+            for filename in filenames:
+                if not isinstance(filename, str):
+                    continue
+                path = package_dir / filename
+                if not path.exists():
+                    continue
+                with path.open(encoding="utf-8", newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        key = row[CSV_HEADERS[name][0]]
+                        current = getattr(self, name).get(key)
+                        if current is not None and current != row:
+                            self.conflicts.append((name, key))
+                            continue
+                        getattr(self, name)[key] = row
 
     def resolve_routine_references(self) -> None:
         routines: dict[tuple[str, str, str], list[str]] = {}
@@ -201,15 +212,18 @@ class GraphPackage:
         config_path: str,
         extractor_version: str = "1.0.0",
         max_csv_rows: int = 1_000_000,
+        max_csv_bytes: int = 8 * 1024 * 1024,
     ) -> None:
         if max_csv_rows < 1:
             raise ValueError("max_csv_rows must be positive")
+        if max_csv_bytes < 1024:
+            raise ValueError("max_csv_bytes must be at least 1024")
         output.mkdir(parents=True, exist_ok=True)
         groups = {name: sorted(getattr(self, name).values(), key=lambda row: row[headers[0]]) for name, headers in CSV_HEADERS.items()}
         checksums: dict[str, dict[str, object]] = {}
         files: dict[str, str | list[str]] = {}
         for name, rows in groups.items():
-            chunks = [rows[index:index + max_csv_rows] for index in range(0, len(rows), max_csv_rows)] or [[]]
+            chunks = _csv_chunks(name, rows, CSV_HEADERS[name], max_csv_rows, max_csv_bytes)
             paths = [
                 output / (f"{name}.csv" if len(chunks) == 1 else f"{name}-{index:06d}.csv")
                 for index in range(1, len(chunks) + 1)
@@ -231,6 +245,7 @@ class GraphPackage:
             "statistics": {"filesScanned": len(self.source_records), **{name: len(rows) for name, rows in groups.items()}},
             "checksums": checksums,
             "metadata": {
+                "managedBy": "code-tree-exporter",
                 "config": Path(config_path).name,
                 "sourceFiles": [
                     {key: value for key, value in record.__dict__.items() if key != "comments"}
@@ -251,6 +266,9 @@ class GraphPackage:
 
 def replace_directory(staging: Path, output: Path) -> None:
     backup = output.with_name(output.name + ".previous")
+    _require_managed_directory(staging)
+    _require_managed_directory(output)
+    _require_managed_directory(backup)
     if backup.exists():
         shutil.rmtree(backup)
     if output.exists():
@@ -261,12 +279,69 @@ def replace_directory(staging: Path, output: Path) -> None:
         if backup.exists() and not output.exists():
             backup.replace(output)
         raise
-    if backup.exists():
-        shutil.rmtree(backup)
 
 
 def _json(value: dict[str, object] | None) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def validate_output_directory(output: Path) -> None:
+    _require_managed_directory(output)
+    _require_managed_directory(output.with_name(output.name + ".previous"))
+
+
+def _require_managed_directory(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise ValueError(f"Output path is not a directory: {path}")
+    try:
+        manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Refusing to replace unmanaged output directory: {path}") from exc
+    extractor = manifest.get("extractor") if isinstance(manifest, dict) else None
+    metadata = manifest.get("metadata") if isinstance(manifest, dict) else None
+    managed = (
+        isinstance(extractor, dict) and extractor.get("name") == "code-tree-exporter"
+    ) or (
+        isinstance(metadata, dict) and metadata.get("managedBy") == "code-tree-exporter"
+    )
+    if not managed:
+        raise ValueError(f"Refusing to replace unmanaged output directory: {path}")
+
+
+def _csv_chunks(
+    name: str,
+    rows: list[dict[str, str]],
+    headers: list[str],
+    max_rows: int,
+    max_bytes: int,
+) -> list[list[dict[str, str]]]:
+    header_bytes = len(_csv_text(headers, None).encode("utf-8"))
+    chunks: list[list[dict[str, str]]] = []
+    current: list[dict[str, str]] = []
+    current_bytes = header_bytes
+    for row in rows:
+        row_bytes = len(_csv_text(headers, row).encode("utf-8"))
+        if header_bytes + row_bytes > max_bytes:
+            raise ValueError(f"{name} row exceeds maxCsvBytes={max_bytes}: {row.get(headers[0], '')}")
+        if current and (len(current) >= max_rows or current_bytes + row_bytes > max_bytes):
+            chunks.append(current)
+            current = []
+            current_bytes = header_bytes
+        current.append(row)
+        current_bytes += row_bytes
+    chunks.append(current)
+    return chunks
+
+
+def _csv_text(headers: list[str], row: dict[str, str] | None) -> str:
+    buffer = io.StringIO(newline="")
+    if row is None:
+        csv.writer(buffer, lineterminator="\n").writerow(headers)
+    else:
+        csv.DictWriter(buffer, fieldnames=headers, lineterminator="\n").writerow(row)
+    return buffer.getvalue()
 
 
 def _replace_ref_node_id(value: object, old_target: str, new_target: str) -> bool:

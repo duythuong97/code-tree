@@ -20,7 +20,7 @@ _FACT_CHILD_GROUPS = (
 )
 
 
-def render_file_tree(package: GraphPackage, output: Path) -> None:
+def render_file_tree(package: GraphPackage, output: Path, max_lines: int = 20_000) -> None:
     records = sorted(
         package.source_records, key=lambda item: (item.source_key, item.relative_path)
     )
@@ -85,12 +85,12 @@ def render_file_tree(package: GraphPackage, output: Path) -> None:
                     classification = "OTHER"
                 counts[str(classification)] += 1
             summary = ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
-            lines.append(f"  - COMMENTS: {len(local_comments)} [{summary}] (full text: comments.csv)")
+            lines.append(f"  - COMMENTS: {len(local_comments)} [{summary}] (full text: manifest files.comments)")
         if relative_output in collisions:
             relative_output = PurePosixPath(record.relative_path + ".md")
         target = output.joinpath(*relative_output.parts)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        target.write_text(_limited_text(lines, max_lines), encoding="utf-8")
 
 
 def _render_node(
@@ -247,7 +247,7 @@ def _edge_line(edge: dict[str, str], evidence: dict[str, list[dict[str, str]]]) 
     return min((_line(row) for row in evidence.get(edge["edge_id"], [])), default=0)
 
 
-def render_system_tree(package: GraphPackage, output: Path) -> None:
+def render_system_tree(package: GraphPackage, output: Path, max_lines: int = 20_000) -> None:
     nodes_by_system: dict[str, list[dict[str, str]]] = defaultdict(list)
     for node in package.nodes.values():
         system = node.get("system_key") or "unassigned"
@@ -276,4 +276,12 @@ def render_system_tree(package: GraphPackage, output: Path) -> None:
                 )
                 lines.append(f"  - {edge['edge_type']} → `{target_name}`")
         lines.append("")
-    output.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    output.write_text(_limited_text(lines, max_lines), encoding="utf-8")
+
+
+def _limited_text(lines: list[str], max_lines: int) -> str:
+    if max_lines < 10:
+        raise ValueError("maxTreeLines must be at least 10")
+    if len(lines) > max_lines:
+        lines = lines[: max_lines - 2] + ["", "_Projection truncated; use manifest CSV files for the complete graph._"]
+    return "\n".join(lines).rstrip() + "\n"

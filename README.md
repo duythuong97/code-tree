@@ -11,6 +11,9 @@ Pipeline thống nhất: scan nhiều source unit, chạy extractor hiện có, 
   "output": "${EXPORT_OUTPUT}",
   "defaultEncoding": "auto",
   "inputData": "${CATALOG_DATA}",
+  "maxCsvRows": 1000000,
+  "maxCsvBytes": 8388608,
+  "maxTreeLines": 20000,
   "sources": [
     { "name": "order-ui", "type": "angular", "folders": ["ui"] },
     {
@@ -50,9 +53,11 @@ Pipeline thống nhất: scan nhiều source unit, chạy extractor hiện có, 
 }
 ```
 
-`root`, `output`, `inputData` nhận đường dẫn tuyệt đối hoặc tương đối với file config. Dùng đường dẫn tương đối hoặc biến môi trường để cùng một config chạy trên máy khác. `inputData` có thể bỏ nếu không có catalog. `folders` là đường dẫn tương đối; chấp nhận cả `/` và `\\`, nhưng `/` được khuyến nghị cho macOS/Windows.
+`root`, `output`, `inputData` nhận đường dẫn tuyệt đối hoặc tương đối với file config. Dùng đường dẫn tương đối hoặc biến môi trường để cùng một config chạy trên máy khác. `inputData` có thể bỏ nếu không có catalog, nhưng phải nằm ngoài `output` và `output.previous` để rerun không xóa input. `folders` là đường dẫn tương đối; chấp nhận cả `/` và `\\`, nhưng `/` được khuyến nghị cho macOS/Windows. Với `.NET`, `folders` có thể trỏ thẳng tới `.cs`, `.csproj`, `.sln`; pipeline tự stage project/solution reference closure. XML mapper có `mapper namespace` và statement SQL trong cùng source `.NET` được đọc tự động; XML cấu hình thông thường bị bỏ qua an toàn.
 
-Runtime tùy extractor: Python 3.10+, Node.js + TypeScript cho Angular, .NET SDK 9 cho Roslyn. Có thể chỉ định executable không nằm trong `PATH` bằng `CODE_TREE_NODE` và `CODE_TREE_DOTNET`. Thiếu Node.js, Angular tự dùng Python fallback với độ chính xác thấp hơn.
+`maxCsvRows` và `maxCsvBytes` giới hạn từng CSV chunk; graph CSV vẫn lossless. Một row lớn hơn `maxCsvBytes` làm extraction dừng thay vì cắt dữ liệu. `maxTreeLines` chỉ giới hạn projection Markdown; dữ liệu đầy đủ nằm trong các file được liệt kê bởi `manifest.json`.
+
+Runtime tùy extractor: Python 3.10+, Node.js + TypeScript cho Angular, .NET SDK 9 cho Roslyn. Có thể chỉ định executable không nằm trong `PATH` bằng `CODE_TREE_NODE` và `CODE_TREE_DOTNET`. Thiếu Node.js/TypeScript hoặc primary parser lỗi, Angular dùng Python fallback, đồng thời ghi `SEMANTIC_TREE_UNAVAILABLE`; fallback không bảo toàn đầy đủ nested behavior.
 
 Sao chép `.env.example` thành `.env` trên mỗi máy rồi sửa path. CLI tự đọc `.env` cạnh file config; nếu không có thì đọc `.env` tại thư mục chạy. Biến đã export trong process có ưu tiên cao hơn `.env`. `.env` bị Git bỏ qua; chỉ `.env.example` được commit để liệt kê cấu hình cần thiết.
 
@@ -95,13 +100,13 @@ pyproject.toml          # build, dependency, package resources
 ```text
 dist/
 ├── manifest.json
-├── nodes.csv
-├── edges.csv
-├── evidence.csv
-├── comments.csv
-├── issues.csv
+├── nodes.csv hoặc nodes-000001.csv...
+├── edges.csv hoặc edges-000001.csv...
+├── evidence.csv hoặc evidence-000001.csv...
+├── comments.csv hoặc comments-000001.csv...
+├── issues.csv hoặc issues-000001.csv...
 ├── file-trees/
 └── SYSTEM_TREE.md
 ```
 
-Output được dựng trong staging rồi thay atomic. Decode strict; lỗi encoding tạo issue, file lỗi không được parse.
+Output được dựng trong staging rồi thay atomic. Rerun giữ snapshot trước tại `<output>.previous`. Chỉ thư mục có manifest `managedBy: code-tree-exporter` mới được thay/xóa; output không được quản lý bị từ chối để giữ dữ liệu người dùng. Decode strict; lỗi encoding tạo issue, file lỗi không được parse.

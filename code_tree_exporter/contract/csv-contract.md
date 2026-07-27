@@ -56,7 +56,7 @@ issue_id,issue_type,severity,source_node_id,raw_reference,database_key,source_pa
 target_type,target_id,field_name,locale,value,source_kind,review_status,author_name,created_at,updated_at
 ```
 
-Packages may omit this file entirely. When present, `files.localized_texts`, `statistics.localized_texts`, and the optional `checksums["localized_texts.csv"]` entry must describe it. `target_type` is a node type such as `TABLE`, `COLUMN`, `SCREEN`, or `API_OPERATION`; `EDGE` may be used for edge-localized text. `target_id`, `field_name`, and `locale` are unique together. Empty localization rows are not generated; missing English text is valid and display fallback is handled by the application.
+Packages may omit this file entirely. When present, `files.localized_texts`, `statistics.localized_texts`, and checksum entries for every declared chunk must describe it. `target_type` is a node type such as `TABLE`, `COLUMN`, `SCREEN`, or `API_OPERATION`; `EDGE` may be used for edge-localized text. `target_id`, `field_name`, and `locale` are unique together. Empty localization rows are not generated; missing English text is valid and display fallback is handled by the application.
 
 ## Manifest
 
@@ -64,10 +64,11 @@ Packages may omit this file entirely. When present, `files.localized_texts`, `st
 
 Compatibility decision for this repo:
 
-- All generated and demo packages use `contractVersion: "1.0"` with `extractor`, `source`, `generatedAt`, `files`, and `statistics` exactly as in the requirements. `localized_texts.csv` remains optional. `checksums` is optional for development fixtures and, when present, is validated for every declared CSV.
-- The former additive `contractVersion: "2.0.0"` manifest shape is no longer accepted by the importer because the requirements-native `1.0` document is the canonical contract.
+- Generated packages use `contractVersion: "1.1"`. Each `files` value is one CSV filename or an ordered list of lossless CSV chunks. Every checksum records SHA-256, bytes, and data-row count.
+- Importers remain compatible with `contractVersion: "1.0"` single-file manifests. `localized_texts` remains optional.
+- The former additive `contractVersion: "2.0.0"` manifest shape remains unsupported.
 
-The `1.0` shape normalizes to the importer fields `packageId`, `sourceId`, `createdAt`, `files`, and `counts`. Counts/statistics are non-negative integers and describe published rows. Production packages include a SHA-256 checksum for every CSV.
+Counts/statistics are non-negative integers and describe all published rows across chunks. Production packages include a checksum for every declared CSV chunk.
 
 Validator scope required by sections 6-9 and 21:
 
