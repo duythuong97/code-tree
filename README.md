@@ -1,9 +1,14 @@
 # Code Tree Exporter
 
-Pipeline tạo codebase knowledge từ nhiều source unit. `graph.sqlite` là nguồn truth;
-`graph-index.json` và `codebase-memory/*.jsonl` phục vụ tool/CLI; `knowledge/*.md`
-là projection nhỏ cho Copilot Studio/RAG. Pipeline vẫn giữ comment, encoding,
-evidence và file tree để truy ngược về source.
+Project chạy theo hai bước độc lập. Bước extract đọc source, tạo node/edge và
+ghi vào `graph.sqlite`; bước export Markdown đọc lại database này để tạo
+`knowledge/*.md`, `file-trees/*.md`, `codebase-memory/summaries/*.md` và
+`SYSTEM_TREE.md`. Vì vậy có thể thay đổi projection hoặc export lại Markdown mà
+không phải parse/link source lần nữa.
+
+`graph.sqlite` là nguồn truth; `graph-index.json` và
+`codebase-memory/*.jsonl` phục vụ tool/CLI. Comment, encoding và evidence vẫn
+được lưu trong SQLite để truy ngược về source.
 
 ## Config
 
@@ -81,7 +86,9 @@ Với `oracle-plsql`, `semanticDetail: "summary"` là mặc định: chỉ giữ
 expression và call arguments bị lược bỏ khỏi semantic tree. Dùng
 `semanticDetail: "full"` khi cần projection theo từng statement.
 
-`maxTreeLines` chỉ giới hạn projection Markdown; `maxFileBytes` ghi
+`combinedProjection`, `knowledgeChunking` và `maxTreeLines` được lưu vào
+metadata SQLite làm mặc định cho bước export Markdown. `maxTreeLines` chỉ giới
+hạn projection Markdown; `maxFileBytes` ghi
 `FILE_TOO_LARGE` và bỏ riêng file đó; timeout chỉ làm hỏng extractor/source đang
 chạy, không xóa graph của source khác.
 
@@ -98,7 +105,12 @@ Sao chép `.env.example` thành `.env` trên mỗi máy rồi sửa path. CLI t�
 - Cài CLI từ source: `python3 -m pip install .` hoặc `py -m pip install .`
 
 Node.js + TypeScript và .NET SDK 9 là runtime ngoài Python; chỉ cần cài khi
-config dùng Angular hoặc .NET. Trên Windows, có thể đặt
+config dùng Angular hoặc .NET. Extractor `.NET` dùng `MSBuildWorkspace`, nên
+SDK mà `global.json`/project yêu cầu cũng phải có trên máy. Nếu workspace không
+load được project, extractor ghi `MSBUILD_WORKSPACE_DIAGNOSTIC` và chỉ dùng
+fallback compilation cho các file bị ảnh hưởng. Lần chạy đầu build worker
+Release; các lần sau chạy DLL trực tiếp nếu source worker không đổi. Trên
+Windows, có thể đặt
 `CODE_TREE_WINDOWS_WORKER` tới executable, Python script hoặc .NET DLL dùng
 Visual Studio Build Tools/MSBuildWorkspace; nếu không đặt, .NET Framework chạy
 syntax/config best effort. Nếu TypeScript semantic runtime không load được,
@@ -107,7 +119,7 @@ và ghi `SEMANTIC_TREE_UNAVAILABLE`.
 
 ## Chạy
 
-Sau khi cài package, cả macOS và Windows:
+### 1. Extract graph vào SQLite
 
 ```text
 code-tree-exporter --config <absolute-config-path>
@@ -119,6 +131,34 @@ Chạy trực tiếp từ source:
 - Windows: `py -m code_tree_exporter --config C:\\path\\extractor-config.json`
 
 `python -m cli` vẫn được giữ làm lệnh tương thích.
+
+Bước này tạo `graph.sqlite` và các index/memory dạng machine-readable, không tạo
+file Markdown.
+
+### 2. Export Markdown từ SQLite
+
+Ghi Markdown cạnh database:
+
+```text
+code-tree-export-markdown --database <dist/graph.sqlite>
+```
+
+Hoặc ghi sang thư mục riêng:
+
+```text
+code-tree-export-markdown --database <dist> --output <markdown-dist>
+```
+
+`--database` nhận cả file `graph.sqlite` lẫn thư mục chứa file đó. Có thể override
+config đã lưu bằng `--max-tree-lines`, `--combined-projection` hoặc
+`--no-combined-projection`.
+
+Chạy trực tiếp từ source:
+
+```text
+python3 -m code_tree_exporter.markdown_export --database <dist>
+python3 scripts/export_markdown.py --database <dist>
+```
 
 ## Query knowledge
 
@@ -150,7 +190,7 @@ cli.py                  # compatibility shim
 pyproject.toml          # build, dependency, package resources
 ```
 
-## Output
+## Output sau bước extract
 
 ```text
 dist/
@@ -160,6 +200,17 @@ dist/
 ├── codebase-memory/
 │   ├── entities/*.jsonl
 │   ├── relationships/*.jsonl
+│   └── manifest.json
+```
+
+## Output sau bước export Markdown
+
+Nếu không truyền `--output`, các file sau được thêm vào `dist/`:
+
+```text
+dist/
+├── markdown-manifest.json
+├── codebase-memory/
 │   └── summaries/*.md
 ├── knowledge/
 │   ├── manifest.json
@@ -174,4 +225,7 @@ số mới và stable ID cũ. Edge/evidence/comment/issue tham chiếu bằng kh
 không lặp lại chuỗi ID dài. JSON response biểu diễn ID số dưới dạng decimal
 string để không mất precision trên JavaScript.
 
-Output được dựng trong staging rồi thay atomic. Rerun giữ snapshot trước tại `<output>.previous`. Chỉ thư mục có manifest `managedBy: code-tree-exporter` mới được thay/xóa; output không được quản lý bị từ chối để giữ dữ liệu người dùng. Decode strict; lỗi encoding tạo issue, file lỗi không được parse.
+Output extract được dựng trong staging rồi thay atomic. Rerun giữ snapshot trước
+tại `<output>.previous`. Markdown exporter chỉ thay các projection do tool quản
+lý và từ chối ghi đè output không có manifest hợp lệ. Decode strict; lỗi
+encoding tạo issue, file lỗi không được parse.

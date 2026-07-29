@@ -496,15 +496,17 @@ class GraphPackage:
                 "MERGE_CONFLICT", f"Conflicting {name} row: {key}", severity="WARNING"
             )
 
-    def write(
+    def write_sqlite(
         self,
         output: Path,
         *,
         source_name: str,
         config_path: str,
-        extractor_version: str = "0.4.0",
+        extractor_version: str = "0.5.0",
         output_mode: str = "flat",
+        combined_projection: bool | None = None,
         knowledge_chunking: dict[str, object] | None = None,
+        max_tree_lines: int = 20_000,
         max_evidence_snippet_chars: int = 500,
         max_issues_per_type_per_file: int = 20,
     ) -> None:
@@ -514,8 +516,19 @@ class GraphPackage:
             raise ValueError("max_evidence_snippet_chars must be positive")
         if max_issues_per_type_per_file < 1:
             raise ValueError("max_issues_per_type_per_file must be positive")
+        if max_tree_lines < 10:
+            raise ValueError("max_tree_lines must be at least 10")
         output.mkdir(parents=True, exist_ok=True)
         generated_at = _utc_now()
+        markdown_options = {
+            "combinedProjection": (
+                output_mode == "flat"
+                if combined_projection is None
+                else combined_projection
+            ),
+            "knowledgeChunking": knowledge_chunking or {},
+            "maxTreeLines": max_tree_lines,
+        }
         self.deduplicate()
 
         # Apply output bounds before compacting so synthesized issue rows also
@@ -553,6 +566,8 @@ class GraphPackage:
             evidence_packages=evidence_packages,
             comment_packages=partition["comment_packages"],
             issue_packages=issue_packages,
+            output_mode=output_mode,
+            markdown_options=markdown_options,
         )
         root_manifest = {
             "contractVersion": "2.0",
@@ -572,7 +587,6 @@ class GraphPackage:
                 "database": "graph.sqlite",
                 "graphIndex": "graph-index.json",
                 "memoryManifest": "codebase-memory/manifest.json",
-                "knowledgeManifest": "knowledge/manifest.json",
             },
             "statistics": {
                 "filesScanned": len(self.source_records),
@@ -589,20 +603,15 @@ class GraphPackage:
                 "config": Path(config_path).name,
                 "sourceCount": len([key for key in packages if key != "global"]),
                 "identity": "deterministic-63-bit",
+                "artifactType": "extracted-graph",
             },
         }
-
-        knowledge_refs = _write_knowledge(
+        memory_refs = write_codebase_memory(
             self,
             output,
             generated_at=generated_at,
-            chunking=knowledge_chunking or {},
-        )
-        memory_refs = _write_codebase_memory(
-            self,
-            output,
-            generated_at=generated_at,
-            knowledge_refs=knowledge_refs,
+            knowledge_refs={},
+            write_summaries=False,
         )
         _write_graph_index(
             self,
@@ -613,13 +622,17 @@ class GraphPackage:
             edge_packages=edge_packages,
             evidence_packages=evidence_packages,
             issue_packages=issue_packages,
-            knowledge_refs=knowledge_refs,
+            knowledge_refs={},
             memory_refs=memory_refs,
         )
         (output / "manifest.json").write_text(
             json.dumps(root_manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+    def write(self, output: Path, **kwargs) -> None:
+        """Compatibility wrapper for callers using the former publisher API."""
+        self.write_sqlite(output, **kwargs)
 
     def _add_edge(self, source: str, target: str, edge_type: str, layer: str) -> None:
         edge_id = canonical_edge_id(source, edge_type, target, "", layer)
@@ -893,6 +906,8 @@ def _write_sqlite_database(
     evidence_packages: dict[str, str],
     comment_packages: dict[str, str],
     issue_packages: dict[str, str],
+    output_mode: str,
+    markdown_options: dict[str, object],
 ) -> None:
     if path.exists():
         path.unlink()
@@ -1032,6 +1047,12 @@ def _write_sqlite_database(
                 ("generated_at", json.dumps(generated_at)),
                 ("source_name", json.dumps(source_name)),
                 ("identity", json.dumps("deterministic-63-bit")),
+                ("output_mode", json.dumps(output_mode)),
+                ("markdown_options", json.dumps(markdown_options)),
+                (
+                    "source_descriptors",
+                    json.dumps(graph.source_descriptors, ensure_ascii=False),
+                ),
             ],
         )
         connection.executemany(
@@ -1424,18 +1445,40 @@ def _partition_graph(
     }
 
 
+def write_codebase_memory(
+    graph: GraphPackage,
+    output: Path,
+    *,
+    generated_at: str | None = None,
+    knowledge_refs: dict[str, list[str]] | None = None,
+    write_summaries: bool = True,
+) -> dict[str, dict[str, object]]:
+    """Write machine-readable memory and its optional Markdown summaries."""
+    return _write_codebase_memory(
+        graph,
+        output,
+        generated_at=generated_at or _utc_now(),
+        knowledge_refs=knowledge_refs or {},
+        write_summaries=write_summaries,
+    )
+
+
 def _write_codebase_memory(
     graph: GraphPackage,
     output: Path,
     *,
     generated_at: str,
     knowledge_refs: dict[str, list[str]],
+    write_summaries: bool = True,
 ) -> dict[str, dict[str, object]]:
     memory_dir = output / "codebase-memory"
     entities_dir = memory_dir / "entities"
     relationships_dir = memory_dir / "relationships"
     summaries_dir = memory_dir / "summaries"
-    for directory in (entities_dir, relationships_dir, summaries_dir):
+    directories = [entities_dir, relationships_dir]
+    if write_summaries:
+        directories.append(summaries_dir)
+    for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
 
     outgoing, incoming, evidence_by_target, issues_by_node = _graph_indexes(graph)
@@ -1513,8 +1556,10 @@ def _write_codebase_memory(
             for record in records:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    summary_files = _write_memory_summaries(
-        memory_dir, entity_groups, relationship_groups
+    summary_files = (
+        _write_memory_summaries(memory_dir, entity_groups, relationship_groups)
+        if write_summaries
+        else []
     )
     manifest = {
         "version": "1.0",
@@ -1949,6 +1994,22 @@ def _write_memory_summaries(
             lines.append("- No cards generated.")
         (memory_dir / relative).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return list(cards)
+
+
+def write_knowledge_markdown(
+    graph: GraphPackage,
+    output: Path,
+    *,
+    generated_at: str | None = None,
+    chunking: dict[str, object] | None = None,
+) -> dict[str, list[str]]:
+    """Write the RAG Markdown projection for an already extracted graph."""
+    return _write_knowledge(
+        graph,
+        output,
+        generated_at=generated_at or _utc_now(),
+        chunking=chunking or {},
+    )
 
 
 def _write_knowledge(

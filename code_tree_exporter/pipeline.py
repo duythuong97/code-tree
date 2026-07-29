@@ -21,7 +21,6 @@ from .graph_package import (
     replace_directory,
     validate_output_directory,
 )
-from .renderers import render_file_tree, render_system_tree
 
 _BLOCKED_DIRECTORIES = frozenset(
     {
@@ -182,24 +181,23 @@ def run_pipeline(config_path: Path) -> Path:
         graph.materialize_structure()
         final_staging = temporary_root / "final"
         final_staging.mkdir()
-        max_tree_lines = limits["maxTreeLines"]
-        graph.write(
+        graph.write_sqlite(
             final_staging,
             source_name=str(config.get("name") or root.name),
             config_path=str(config_path),
             output_mode=output_mode,
+            combined_projection=bool(
+                config.get("combinedProjection", output_mode == "flat")
+            ),
             knowledge_chunking=(
                 config.get("knowledgeChunking")
                 if isinstance(config.get("knowledgeChunking"), dict)
                 else {}
             ),
+            max_tree_lines=limits["maxTreeLines"],
             max_evidence_snippet_chars=limits["maxEvidenceSnippetChars"],
             max_issues_per_type_per_file=limits["maxIssuesPerTypePerFile"],
         )
-
-        render_file_tree(graph, final_staging / "file-trees", max_tree_lines)
-        if config.get("combinedProjection", output_mode == "flat"):
-            render_system_tree(graph, final_staging / "SYSTEM_TREE.md", max_tree_lines)
         replace_directory(final_staging, output)
     return output
 
@@ -450,6 +448,20 @@ def _selected_files(root: Path, folders: list, suffixes: tuple[str, ...]) -> lis
 
 def _expand_dotnet_selection(root: Path, selected: list[Path]) -> list[Path]:
     result = set(selected)
+    for path in root.rglob("*"):
+        is_msbuild_file = _safe_source_file(
+            path, root, {".props", ".targets", ".proj", ".rsp"}
+        )
+        is_dotnet_config = (
+            path.is_file()
+            and path.name.lower() in {"global.json", "nuget.config"}
+            and not (
+                _BLOCKED_DIRECTORIES
+                & {part.lower() for part in path.relative_to(root).parts}
+            )
+        )
+        if is_msbuild_file or is_dotnet_config:
+            result.add(path)
     projects: list[Path] = [
         path for path in selected if path.suffix.lower() == ".csproj"
     ]

@@ -19,6 +19,12 @@ query CLI.
 - `sources`: decoded source-file metadata.
 - `metadata`: database contract and generation metadata.
 
+The extraction step publishes the database, root manifest, graph index, and
+JSONL codebase memory only. It does not publish Markdown. The `metadata` table
+stores `output_mode`, `markdown_options`, and `source_descriptors` so
+`code-tree-export-markdown` can recreate all Markdown projections without
+reading the original source tree or extractor config.
+
 All graph tables include `package_key`; logical source partitions therefore
 remain queryable without duplicating graph files. `properties_json` is a JSON
 object. References inside known JSON values are rewritten to compact integer ID
@@ -63,3 +69,5 @@ rewrites rather than rescanning the graph once per missing node.
 
 Extractor subprocesses may still exchange temporary CSV package files with the
 pipeline. Those files are internal staging data and are not published output.
+Markdown is a separate derived artifact produced from `graph.sqlite` by
+`code-tree-export-markdown` (or `python -m code_tree_exporter.markdown_export`).

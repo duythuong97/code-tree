@@ -11,8 +11,7 @@ from .pipeline import run_pipeline
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract configured source units into graph packages, codebase memory, "
-            "and RAG knowledge."
+            "Extract configured source units into a SQLite graph package."
         )
     )
     parser.add_argument(

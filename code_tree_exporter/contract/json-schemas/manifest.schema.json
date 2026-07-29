@@ -60,8 +60,7 @@
       "required": [
         "database",
         "graphIndex",
-        "memoryManifest",
-        "knowledgeManifest"
+        "memoryManifest"
       ],
       "properties": {
         "database": {"const": "graph.sqlite"},

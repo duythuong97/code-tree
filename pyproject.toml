@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "code-tree-exporter"
-version = "0.4.0"
-description = "Extract source code into a queryable graph, codebase memory, and RAG knowledge"
+version = "0.5.0"
+description = "Extract source code into SQLite and export queryable Markdown projections"
 requires-python = ">=3.10"
 dependencies = ["antlr4-python3-runtime==4.13.2"]
 
 [project.scripts]
 code-tree-exporter = "code_tree_exporter.cli:main"
+code-tree-export-markdown = "code_tree_exporter.markdown_export:main"
 code-tree-query = "code_tree_exporter.query:main"
 
 [tool.setuptools.packages.find]
