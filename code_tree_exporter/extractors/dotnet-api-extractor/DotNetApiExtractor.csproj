@@ -9,6 +9,7 @@
     <Compile Include="../_roslyn/CodeMapExtractorSupport.cs" Link="CodeMapExtractorSupport.cs" />
   </ItemGroup>
   <ItemGroup>
+    <Reference Include="Microsoft.Build" HintPath="$(MSBuildToolsPath)/Microsoft.Build.dll" />
     <Reference Include="Microsoft.CodeAnalysis" HintPath="$(MSBuildToolsPath)/Roslyn/bincore/Microsoft.CodeAnalysis.dll" />
     <Reference Include="Microsoft.CodeAnalysis.CSharp" HintPath="$(MSBuildToolsPath)/Roslyn/bincore/Microsoft.CodeAnalysis.CSharp.dll" />
   </ItemGroup>

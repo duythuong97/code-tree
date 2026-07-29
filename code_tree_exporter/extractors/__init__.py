@@ -23,17 +23,17 @@ _SPECS = {
     "dotnet": ExtractorSpec(
         "dotnet-api",
         _ROOT.parent / "dotnet-api-extractor" / "main.py",
-        (".cs", ".csproj", ".sln", ".xml"),
+        (".cs", ".csproj", ".sln", ".xml", ".config", ".json"),
     ),
     "dotnet-api": ExtractorSpec(
         "dotnet-api",
         _ROOT.parent / "dotnet-api-extractor" / "main.py",
-        (".cs", ".csproj", ".sln", ".xml"),
+        (".cs", ".csproj", ".sln", ".xml", ".config", ".json"),
     ),
     "dotnet-batch": ExtractorSpec(
         "dotnet-batch",
         _ROOT.parent / "dotnet-batch-extractor" / "main.py",
-        (".cs", ".csproj", ".sln", ".xml"),
+        (".cs", ".csproj", ".sln", ".xml", ".config", ".json"),
     ),
     "oracle-plsql": ExtractorSpec(
         "oracle-plsql",

@@ -1,4 +1,4 @@
-"""Dependency-free helpers implementing the CSV graph contract."""
+"""Dependency-free helpers implementing stable graph identities and validation."""
 from __future__ import annotations
 
 import hashlib
@@ -13,20 +13,41 @@ NODE_TYPES = frozenset({
     "FUNCTION", "TRIGGER", "VIEW", "MATERIALIZED_VIEW", "SQL_FILE", "EXTERNAL_SYSTEM",
     "EXTERNAL_API_OPERATION", "EXTERNAL_DATABASE_OBJECT", "UNRESOLVED_REFERENCE",
     "ANGULAR_PROJECT", "ANGULAR_COMPONENT", "ANGULAR_SERVICE", "API_CALL_REFERENCE",
-    "DOTNET_SOLUTION", "DOTNET_PROJECT", "CONTROLLER", "SERVICE", "REPOSITORY",
+    "DOTNET_SOLUTION", "DOTNET_PROJECT", "CSHARP_TYPE", "CONTROLLER", "SERVICE", "REPOSITORY",
     "EXECUTABLE_ENTRY_POINT", "LOCAL_ROUTINE", "METHOD", "INLINE_SQL", "SEQUENCE", "SYNONYM", "DATABASE_LINK",
     "COLUMN", "FILE", "SYSTEM", "APPLICATION", "DATA_FILE",
+    "XML_SQL_MAPPER", "MAPPER_STATEMENT", "XML_SQL_FRAGMENT",
+    # v2 knowledge contract names. Legacy producer names above remain valid so
+    # existing extractor packages can be merged during the additive migration.
+    "PROJECT", "ASSEMBLY", "NAMESPACE", "COMPONENT", "ROUTE",
+    "API_CLIENT_CALL", "CONFIG_KEY", "CLASS", "INTERFACE", "PACKAGE",
+    "SQL_STATEMENT", "LOADER_CONTROL",
 })
 EDGE_TYPES = frozenset({
     "CALLS_API", "STARTS", "CALLS", "READS", "REMOTE_READS", "INSERTS", "UPDATES",
     "DELETES", "MERGES", "WRITES", "READS_COLUMN", "WRITES_COLUMN", "DERIVES_FROM",
     "POPULATES", "TRIGGERS", "DEPENDS_ON", "USES", "CONTAINS", "HANDLED_BY",
     "ENTRY_IN", "RESOLVES_TO", "NAVIGATES_TO", "BELONGS_TO", "PROJECT_REFERENCE",
+    "DEFINES_STATEMENT", "INCLUDES_FRAGMENT",
+    # v2 semantic names. The legacy data-flow verbs are retained as aliases.
+    "IMPLEMENTS", "INJECTS", "RETURNS", "THROWS", "ROUTES_TO", "HANDLES_API",
+    "READS_FROM", "WRITES_TO", "USES_SEQUENCE", "EXECUTES_SQL", "LOADS_INTO",
+    "MAPS_TO", "TRIGGERS_JOB",
 })
 GRAPH_LAYERS = frozenset({"STRUCTURAL", "TECHNICAL", "DATA_FLOW"})
 GRAPH_ROLES = frozenset({"MAIN", "TECHNICAL", "EVIDENCE"})
 TARGET_TYPES = frozenset({"NODE", "EDGE"})
-ISSUE_TYPES = frozenset("TABLE_NOT_IMPORTED COLUMN_NOT_IMPORTED PROCEDURE_NOT_FOUND EXECUTABLE_NOT_MAPPED API_ROUTE_NOT_MATCHED API_ROUTE_AMBIGUOUS AMBIGUOUS_SYMBOL DYNAMIC_SQL DYNAMIC_CONFIG_KEY EXTERNAL_OBJECT PARSE_ERROR INVALID_CONFIG ENCODING_ERROR ENCODING_CONFLICT MERGE_CONFLICT".split())
+ISSUE_TYPES = frozenset(
+    "TABLE_NOT_IMPORTED COLUMN_NOT_IMPORTED PROCEDURE_NOT_FOUND "
+    "EXECUTABLE_NOT_MAPPED API_ROUTE_NOT_MATCHED API_ROUTE_AMBIGUOUS "
+    "AMBIGUOUS_API_LINK AMBIGUOUS_DB_LINK AMBIGUOUS_MAPPER_LINK "
+    "AMBIGUOUS_SYMBOL DYNAMIC_SQL DYNAMIC_CONFIG_KEY EXTERNAL_OBJECT "
+    "PARSE_ERROR INVALID_CONFIG ENCODING_ERROR ENCODING_CONFLICT "
+    "MERGE_CONFLICT DUPLICATE_MAPPER_STATEMENT "
+    "AUTO_DISCOVERED_XML_SQL_TAG UNRESOLVED_XML_INCLUDE "
+    "UNRESOLVED_REFERENCE SEMANTIC_TREE_UNAVAILABLE FILE_TOO_LARGE TIMEOUT "
+    "FALLBACK_USED NO_API_ENDPOINTS".split()
+)
 
 NODE_ID_PREFIXES = {
     "DATABASE": frozenset({"database"}),
@@ -57,6 +78,7 @@ NODE_ID_PREFIXES = {
     "API_CALL_REFERENCE": frozenset({"api-call"}),
     "DOTNET_SOLUTION": frozenset({"dotnet-solution"}),
     "DOTNET_PROJECT": frozenset({"dotnet-project"}),
+    "CSHARP_TYPE": frozenset({"csharp-type"}),
     "CONTROLLER": frozenset({"controller"}),
     "SERVICE": frozenset({"service"}),
     "REPOSITORY": frozenset({"repository"}),
@@ -71,6 +93,21 @@ NODE_ID_PREFIXES = {
     "SYSTEM": frozenset({"system"}),
     "APPLICATION": frozenset({"application"}),
     "DATA_FILE": frozenset({"data-file"}),
+    "XML_SQL_MAPPER": frozenset({"xml-sql-mapper"}),
+    "MAPPER_STATEMENT": frozenset({"mapper-statement"}),
+    "XML_SQL_FRAGMENT": frozenset({"xml-sql-fragment"}),
+    "PROJECT": frozenset({"project", "angular-project", "dotnet-project"}),
+    "ASSEMBLY": frozenset({"assembly"}),
+    "NAMESPACE": frozenset({"namespace"}),
+    "COMPONENT": frozenset({"component", "angular-component"}),
+    "ROUTE": frozenset({"route", "screen"}),
+    "API_CLIENT_CALL": frozenset({"api-client-call", "api-call"}),
+    "CONFIG_KEY": frozenset({"config-key"}),
+    "CLASS": frozenset({"class", "csharp-type"}),
+    "INTERFACE": frozenset({"interface", "csharp-type"}),
+    "PACKAGE": frozenset({"package", "plsql-package"}),
+    "SQL_STATEMENT": frozenset({"sql-statement", "inline-sql"}),
+    "LOADER_CONTROL": frozenset({"loader-control", "sql-file"}),
 }
 
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[/\\]")

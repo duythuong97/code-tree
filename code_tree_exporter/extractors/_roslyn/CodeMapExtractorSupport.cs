@@ -3,10 +3,13 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -14,10 +17,16 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 namespace CodeMap.Extractors;
 
 public sealed record SourceFile(string AbsolutePath, string RelativePath, string Text, SyntaxTree? SyntaxTree);
-public sealed record TableReference(string ObjectName, string Operation, string EdgeType, int Start, bool Remote = false);
-public sealed record SequenceReference(string ObjectName, int Start);
+public sealed record TableReference(string ObjectName, string Operation, string EdgeType, int Start, bool Remote = false, string DbLink = "");
+public sealed record SequenceReference(string ObjectName, string Operation, int Start);
 public sealed record ProcedureReference(string ObjectName, int Start);
-public sealed record SqlAnalysis(IReadOnlyList<TableReference> Tables, IReadOnlyList<ProcedureReference> Procedures, IReadOnlyList<SequenceReference> Sequences, IReadOnlyList<int> DynamicOffsets);
+public sealed record SqlAnalysis(
+    IReadOnlyList<TableReference> Tables,
+    IReadOnlyList<ProcedureReference> Procedures,
+    IReadOnlyList<SequenceReference> Sequences,
+    IReadOnlyList<int> DynamicOffsets,
+    IReadOnlyList<int> ParseErrorOffsets,
+    bool Recognized);
 public sealed record EndpointInfo(string Controller, string Action, string Method, string Route, int Start, int HandlerStart, int HandlerEnd, bool IsMinimal = false, SourceFile? File = null, string ControllerIdentity = "");
 public sealed record StringLiteralInfo(string OwnerClass, string Value, int Start, SourceFile File);
 public sealed record StringExpressionInfo(string OwnerClass, string OwnerMember, string Value, int Start, SourceFile File, bool IsDynamic, string ExpressionText, string OwnerClassIdentity = "");
@@ -55,27 +64,32 @@ public static class ExtractorRuntime
     public static List<SourceFile> ConfiguredFiles(JsonElement config, IReadOnlyCollection<string> extensions)
     {
         var root = ConfigPath(config, "root");
-        var folders = new List<string>();
-        if (config.TryGetProperty("folders", out var foldersElement) && foldersElement.ValueKind == JsonValueKind.Array)
+        var selections = new List<string>();
+        if (config.TryGetProperty("files", out var filesElement) && filesElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in filesElement.EnumerateArray())
+                if (item.ValueKind == JsonValueKind.String) selections.Add(item.GetString() ?? string.Empty);
+        }
+        else if (config.TryGetProperty("folders", out var foldersElement) && foldersElement.ValueKind == JsonValueKind.Array)
         {
             foreach (var item in foldersElement.EnumerateArray())
             {
-                if (item.ValueKind == JsonValueKind.String) folders.Add(item.GetString() ?? ".");
-                else if (item.ValueKind == JsonValueKind.Object) folders.Add(String(item, "path", "."));
+                if (item.ValueKind == JsonValueKind.String) selections.Add(item.GetString() ?? ".");
+                else if (item.ValueKind == JsonValueKind.Object) selections.Add(String(item, "path", "."));
             }
         }
-        if (folders.Count == 0) folders.Add(".");
+        if (selections.Count == 0) selections.Add(".");
 
         var files = new List<SourceFile>();
         var seen = new HashSet<string>(PathComparer);
-        foreach (var folder in folders)
+        foreach (var selection in selections)
         {
-            var absoluteFolder = Path.GetFullPath(Path.Combine(root, NativePath(folder)));
-            if (!IsWithin(absoluteFolder, root)) throw new ArgumentException($"Folder escapes root: {folder}");
-            var candidates = File.Exists(absoluteFolder)
-                ? new[] { absoluteFolder }
-                : Directory.Exists(absoluteFolder)
-                    ? Directory.EnumerateFiles(absoluteFolder, "*", SearchOption.AllDirectories).OrderBy(p => p, PathComparer)
+            var absoluteSelection = Path.GetFullPath(Path.Combine(root, NativePath(selection)));
+            if (!IsWithin(absoluteSelection, root)) throw new ArgumentException($"Source selection escapes root: {selection}");
+            var candidates = File.Exists(absoluteSelection)
+                ? new[] { absoluteSelection }
+                : Directory.Exists(absoluteSelection)
+                    ? Directory.EnumerateFiles(absoluteSelection, "*", SearchOption.AllDirectories).OrderBy(p => p, PathComparer)
                     : Enumerable.Empty<string>();
             foreach (var path in candidates)
             {
@@ -142,8 +156,11 @@ public static class ExtractorRuntime
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
     }
 
+    public static IEnumerable<TypeDeclarationSyntax> Types(SourceFile file)
+        => file.SyntaxTree?.GetRoot().DescendantNodes().OfType<TypeDeclarationSyntax>() ?? Enumerable.Empty<TypeDeclarationSyntax>();
+
     public static IEnumerable<ClassDeclarationSyntax> Classes(SourceFile file)
-        => file.SyntaxTree?.GetRoot().DescendantNodes().OfType<ClassDeclarationSyntax>() ?? Enumerable.Empty<ClassDeclarationSyntax>();
+        => Types(file).OfType<ClassDeclarationSyntax>();
 
     public static List<EndpointInfo> Endpoints(SourceFile file, SemanticModel model)
     {
@@ -225,18 +242,19 @@ public static class ExtractorRuntime
             var sourceClass = SourceClassForNode(invocation);
             if (string.IsNullOrEmpty(sourceClass) && invocation.Ancestors().OfType<GlobalStatementSyntax>().Any()) sourceClass = "MinimalApi";
             if (string.IsNullOrEmpty(sourceClass)) continue;
-            var symbol = InvocationMethodSymbol(invocation, model);
-            var targetSymbol = ResolveInterfaceImplementation(symbol, model.Compilation, classes) ?? symbol;
-            if (symbol?.ContainingType.TypeKind == TypeKind.Interface && SymbolEqualityComparer.Default.Equals(targetSymbol, symbol)) continue;
-            var targetClass = MatchKnownClass(targetSymbol?.ContainingType?.Name ?? string.Empty, classes);
-            if (string.IsNullOrEmpty(targetClass)) targetClass = ResolveInvocationTargetClass(invocation, model, classes);
+
+            var operation = model.GetOperation(invocation) as Microsoft.CodeAnalysis.Operations.IInvocationOperation;
+            var targetSymbol = operation?.TargetMethod ?? InvocationMethodSymbol(invocation, model);
+            if (targetSymbol is null) continue;
+
+            var targetClass = MatchKnownClass(targetSymbol.ContainingType?.Name ?? string.Empty, classes);
             if (string.IsNullOrEmpty(targetClass)) continue;
             var sourceType = invocation.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
             var sourceClassIdentity = sourceType is null ? string.Empty : TypeIdentity(model.GetDeclaredSymbol(sourceType));
-            var targetClassIdentity = TypeIdentity(targetSymbol?.ContainingType);
-            var targetReference = targetSymbol?.DeclaringSyntaxReferences.FirstOrDefault();
+            var targetClassIdentity = TypeIdentity(targetSymbol.ContainingType);
+            var targetReference = targetSymbol.DeclaringSyntaxReferences.FirstOrDefault();
             var targetIdentity = targetReference is null ? string.Empty : DeclarationIdentity(targetReference.SyntaxTree, targetReference.Span.Start);
-            yield return new InvocationInfo(sourceClass, SourceMemberForNode(invocation), targetClass, targetSymbol?.Name ?? InvocationName(invocation), invocation.SpanStart, file, sourceClassIdentity, targetClassIdentity, targetIdentity);
+            yield return new InvocationInfo(sourceClass, SourceMemberForNode(invocation), targetClass, targetSymbol.Name, invocation.SpanStart, file, sourceClassIdentity, targetClassIdentity, targetIdentity);
         }
     }
 
@@ -249,21 +267,26 @@ public static class ExtractorRuntime
             var sourceClass = SourceClassForNode(invocation);
             if (string.IsNullOrEmpty(sourceClass)) continue;
             var sourceMember = SourceMemberForNode(invocation);
-            var symbol = InvocationMethodSymbol(invocation, model);
-            var targetSymbol = ResolveInterfaceImplementation(symbol, model.Compilation, classes) ?? symbol;
-            if (symbol?.ContainingType.TypeKind == TypeKind.Interface && SymbolEqualityComparer.Default.Equals(targetSymbol, symbol)) continue;
-            var targetClass = MatchKnownClass(targetSymbol?.ContainingType?.Name ?? string.Empty, classes);
-            if (string.IsNullOrEmpty(targetClass)) targetClass = ResolveInvocationTargetClass(invocation, model, classes);
-            if (string.IsNullOrEmpty(targetClass)) continue;
-            var targetMember = targetSymbol?.Name ?? InvocationName(invocation);
-            var sourceDeclaration = invocation.AncestorsAndSelf().OfType<MethodDeclarationSyntax>().FirstOrDefault();
-            var sourceIdentity = sourceDeclaration is null ? string.Empty : DeclarationIdentity(sourceDeclaration.SyntaxTree, sourceDeclaration.SpanStart);
-            var targetReference = targetSymbol?.DeclaringSyntaxReferences.FirstOrDefault();
-            var targetIdentity = targetReference is null ? string.Empty : DeclarationIdentity(targetReference.SyntaxTree, targetReference.Span.Start);
-            var sourceType = invocation.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
-            var sourceClassIdentity = sourceType is null ? string.Empty : TypeIdentity(model.GetDeclaredSymbol(sourceType));
-            var targetClassIdentity = TypeIdentity(targetSymbol?.ContainingType);
-            yield return new MethodInvocationInfo(sourceClass, sourceMember, targetClass, targetMember, invocation.SpanStart, file, sourceIdentity, targetIdentity, sourceClassIdentity, targetClassIdentity);
+
+            var operation = model.GetOperation(invocation) as Microsoft.CodeAnalysis.Operations.IInvocationOperation;
+            var symbol = operation?.TargetMethod ?? InvocationMethodSymbol(invocation, model);
+            if (symbol is null) continue;
+
+            var implementations = InterfaceImplementations(symbol, model.Compilation, classes);
+            var targets = implementations.Count > 0 ? implementations : new[] { symbol };
+            foreach (var targetSymbol in targets)
+            {
+                var targetClass = classes.FirstOrDefault(name => name.Equals(targetSymbol.ContainingType?.Name, StringComparison.Ordinal));
+                if (string.IsNullOrEmpty(targetClass)) continue;
+                var sourceDeclaration = invocation.AncestorsAndSelf().OfType<MethodDeclarationSyntax>().FirstOrDefault();
+                var sourceIdentity = sourceDeclaration is null ? string.Empty : DeclarationIdentity(sourceDeclaration.SyntaxTree, sourceDeclaration.SpanStart);
+                var targetReference = targetSymbol.DeclaringSyntaxReferences.FirstOrDefault();
+                var targetIdentity = targetReference is null ? string.Empty : DeclarationIdentity(targetReference.SyntaxTree, targetReference.Span.Start);
+                var sourceType = invocation.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
+                var sourceClassIdentity = sourceType is null ? string.Empty : TypeIdentity(model.GetDeclaredSymbol(sourceType));
+                var targetClassIdentity = TypeIdentity(targetSymbol.ContainingType);
+                yield return new MethodInvocationInfo(sourceClass, sourceMember, targetClass, targetSymbol.Name, invocation.SpanStart, file, sourceIdentity, targetIdentity, sourceClassIdentity, targetClassIdentity);
+            }
         }
     }
 
@@ -410,7 +433,6 @@ public static class ExtractorRuntime
             InterpolatedStringExpressionSyntax => true,
             BinaryExpressionSyntax binary when binary.IsKind(SyntaxKind.AddExpression) => true,
             InvocationExpressionSyntax invocation when IsStringFormatInvocation(invocation) => true,
-            IdentifierNameSyntax or MemberAccessExpressionSyntax when model.GetConstantValue(expression) is { HasValue: true, Value: string } => true,
             ParenthesizedExpressionSyntax parenthesized => IsStringExpressionRootCandidate(parenthesized.Expression, model),
             _ => false,
         };
@@ -532,7 +554,7 @@ public static class ExtractorRuntime
     }
 
     static string SourceClassForNode(SyntaxNode node)
-        => node.AncestorsAndSelf().OfType<ClassDeclarationSyntax>().FirstOrDefault()?.Identifier.Text ?? string.Empty;
+        => node.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault()?.Identifier.Text ?? string.Empty;
 
     static string SourceMemberForNode(SyntaxNode node)
         => node.AncestorsAndSelf().OfType<MethodDeclarationSyntax>().FirstOrDefault()?.Identifier.Text
@@ -540,78 +562,8 @@ public static class ExtractorRuntime
            ?? node.AncestorsAndSelf().OfType<PropertyDeclarationSyntax>().FirstOrDefault()?.Identifier.Text
            ?? string.Empty;
 
-    static string ResolveInvocationTargetClass(InvocationExpressionSyntax invocation, SemanticModel model, IReadOnlyCollection<string> knownClasses)
-    {
-        var symbol = InvocationMethodSymbol(invocation, model);
-        var symbolMatch = MatchKnownClass(symbol?.ContainingType?.Name ?? string.Empty, knownClasses);
-        if (!string.IsNullOrEmpty(symbolMatch)) return symbolMatch;
-        if (invocation.Expression is MemberAccessExpressionSyntax member)
-        {
-            var receiverMatch = ResolveReceiverClass(member.Expression, model, knownClasses);
-            if (!string.IsNullOrEmpty(receiverMatch)) return receiverMatch;
-        }
-        if (invocation.Expression is MemberBindingExpressionSyntax)
-        {
-            var conditional = invocation.Ancestors().OfType<ConditionalAccessExpressionSyntax>().FirstOrDefault();
-            if (conditional is not null)
-            {
-                var receiverMatch = ResolveReceiverClass(conditional.Expression, model, knownClasses);
-                if (!string.IsNullOrEmpty(receiverMatch)) return receiverMatch;
-            }
-        }
-        return string.Empty;
-    }
-
-    static string ResolveReceiverClass(ExpressionSyntax receiver, SemanticModel model, IReadOnlyCollection<string> knownClasses)
-    {
-        var type = model.GetTypeInfo(receiver).Type ?? model.GetTypeInfo(receiver).ConvertedType;
-        var typeMatch = MatchKnownClass(type?.Name ?? string.Empty, knownClasses);
-        if (!string.IsNullOrEmpty(typeMatch)) return typeMatch;
-        if (receiver is ObjectCreationExpressionSyntax objectCreation)
-        {
-            var created = MatchKnownClass(objectCreation.Type.ToString().Split('.').Last(), knownClasses);
-            if (!string.IsNullOrEmpty(created)) return created;
-        }
-        if (receiver is IdentifierNameSyntax identifier)
-            return MatchVariableNameToKnownClass(identifier.Identifier.Text, knownClasses);
-        if (receiver is MemberAccessExpressionSyntax memberAccess)
-            return MatchVariableNameToKnownClass(memberAccess.Name.Identifier.Text, knownClasses);
-        return string.Empty;
-    }
-
     static string MatchKnownClass(string typeName, IReadOnlyCollection<string> knownClasses)
-    {
-        if (string.IsNullOrWhiteSpace(typeName)) return string.Empty;
-        var clean = typeName.Split('.').Last();
-        var exact = knownClasses.FirstOrDefault(name => name.Equals(clean, StringComparison.Ordinal));
-        if (!string.IsNullOrEmpty(exact)) return exact;
-        if (clean.StartsWith("I", StringComparison.Ordinal) && clean.Length > 1 && char.IsUpper(clean[1]))
-        {
-            var implementation = clean[1..];
-            return knownClasses.FirstOrDefault(name => name.Equals(implementation, StringComparison.Ordinal)) ?? string.Empty;
-        }
-        return string.Empty;
-    }
-
-    static string MatchVariableNameToKnownClass(string variableName, IReadOnlyCollection<string> knownClasses)
-    {
-        var clean = variableName.TrimStart('_');
-        if (string.IsNullOrWhiteSpace(clean)) return string.Empty;
-        var pascal = char.ToUpperInvariant(clean[0]) + clean[1..];
-        var exact = MatchKnownClass(pascal, knownClasses);
-        if (!string.IsNullOrEmpty(exact)) return exact;
-        if (clean.Equals("service", StringComparison.OrdinalIgnoreCase))
-        {
-            var candidates = knownClasses.Where(name => name.EndsWith("Service", StringComparison.Ordinal)).ToList();
-            return candidates.Count == 1 ? candidates[0] : string.Empty;
-        }
-        if (clean.Equals("repository", StringComparison.OrdinalIgnoreCase))
-        {
-            var candidates = knownClasses.Where(name => name.EndsWith("Repository", StringComparison.Ordinal)).ToList();
-            return candidates.Count == 1 ? candidates[0] : string.Empty;
-        }
-        return string.Empty;
-    }
+        => knownClasses.FirstOrDefault(name => name.Equals(typeName, StringComparison.Ordinal)) ?? string.Empty;
 
     static IMethodSymbol? InvocationMethodSymbol(InvocationExpressionSyntax invocation, SemanticModel model)
     {
@@ -621,10 +573,10 @@ public static class ExtractorRuntime
         return candidates.Length == 1 ? candidates[0] : null;
     }
 
-    static IMethodSymbol? ResolveInterfaceImplementation(IMethodSymbol? symbol, Compilation compilation, IReadOnlyCollection<string> knownClasses)
+    static IReadOnlyList<IMethodSymbol> InterfaceImplementations(IMethodSymbol symbol, Compilation compilation, IReadOnlyCollection<string> knownClasses)
     {
-        if (symbol?.ContainingType.TypeKind != TypeKind.Interface) return null;
-        var implementations = compilation.SyntaxTrees
+        if (symbol.ContainingType.TypeKind != TypeKind.Interface) return Array.Empty<IMethodSymbol>();
+        return compilation.SyntaxTrees
             .SelectMany(tree => tree.GetRoot().DescendantNodes().OfType<TypeDeclarationSyntax>())
             .Select(type => compilation.GetSemanticModel(type.SyntaxTree).GetDeclaredSymbol(type))
             .OfType<INamedTypeSymbol>()
@@ -634,7 +586,6 @@ public static class ExtractorRuntime
             .Distinct<ISymbol>(SymbolEqualityComparer.Default)
             .OfType<IMethodSymbol>()
             .ToArray();
-        return implementations.Length == 1 ? implementations[0] : null;
     }
 
     static string TypeIdentity(INamedTypeSymbol? type)
@@ -759,6 +710,29 @@ public static class ExtractorRuntime
     }
 }
 
+public static class MsBuildProjectXml
+{
+    public static string Property(string text, string name)
+        => Document(text).Descendants().FirstOrDefault(element => element.Name.LocalName.Equals(name, StringComparison.OrdinalIgnoreCase))?.Value.Trim() ?? string.Empty;
+
+    public static IEnumerable<string> Includes(string text, string itemName)
+    {
+        foreach (var element in Document(text).Descendants().Where(element => element.Name.LocalName.Equals(itemName, StringComparison.OrdinalIgnoreCase)))
+        {
+            var include = element.Attributes().FirstOrDefault(attribute => attribute.Name.LocalName.Equals("Include", StringComparison.OrdinalIgnoreCase))?.Value.Trim();
+            if (!string.IsNullOrEmpty(include)) yield return include;
+        }
+    }
+
+    static XDocument Document(string text)
+    {
+        using var input = new StringReader(text);
+        using var reader = XmlReader.Create(input, new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null });
+        // ponytail: structural XML only; use evaluated MSBuild when conditions/imports/property expansion affect extraction.
+        return XDocument.Load(reader, LoadOptions.None);
+    }
+}
+
 public sealed class Catalog
 {
     readonly Dictionary<string, Dictionary<string, HashSet<string>>> _tables = new(StringComparer.OrdinalIgnoreCase);
@@ -793,45 +767,47 @@ public sealed class Catalog
 
 public static class SqlAnalyzer
 {
-    static readonly Regex Insert = new(@"\bINSERT\s+(?:INTO\s+)?(?<name>[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?(?:@[A-Za-z_][\w$#]*)?)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    static readonly Regex Update = new(@"\bUPDATE\s+(?<name>[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?(?:@[A-Za-z_][\w$#]*)?)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    static readonly Regex Delete = new(@"\bDELETE\s+FROM\s+(?<name>[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?(?:@[A-Za-z_][\w$#]*)?)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    static readonly Regex Merge = new(@"\bMERGE\s+INTO\s+(?<name>[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?(?:@[A-Za-z_][\w$#]*)?)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    static readonly Regex FromJoin = new(@"\b(?:FROM|JOIN)\s+(?<name>[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)?(?:@[A-Za-z_][\w$#]*)?)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    static readonly Regex Procedure = new(@"\b(?:CALL|EXEC(?:UTE)?)(?!\s+IMMEDIATE)\s+(?<name>[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*){1,2})\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    static readonly Regex BeginProcedure = new(@"\bBEGIN\s+(?<name>[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*){1,2})\s*\(", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    static readonly Regex Sequence = new(@"\b(?<name>(?:[A-Za-z_][\w$#]*\.)?[A-Za-z_][\w$#]*)\s*\.\s*(?:NEXTVAL|CURRVAL)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    static readonly Regex ExecuteImmediateVariable = new(@"\bEXECUTE\s+IMMEDIATE\s+[A-Za-z_][\w$#]*\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    static readonly HashSet<string> Keywords = new(StringComparer.OrdinalIgnoreCase) { "SELECT", "FROM", "WHERE", "JOIN", "ON", "SET", "VALUES", "INTO", "USING" };
+    static readonly object Gate = new();
+    static Process? _process;
 
     public static SqlAnalysis Analyze(string text)
     {
-        var tables = new List<TableReference>();
-        AddTables(tables, text, Insert, "INSERT", "INSERTS");
-        AddTables(tables, text, Update, "UPDATE", "UPDATES");
-        AddTables(tables, text, Delete, "DELETE", "DELETES");
-        AddTables(tables, text, Merge, "MERGE", "MERGES");
-        AddTables(tables, text, FromJoin, "SELECT", "READS");
-        var procedures = Procedure.Matches(text)
-            .Concat(BeginProcedure.Matches(text))
-            .Select(match => new ProcedureReference(match.Groups["name"].Value, match.Groups["name"].Index))
-            .GroupBy(reference => reference.ObjectName, StringComparer.OrdinalIgnoreCase)
-            .Select(group => group.OrderBy(reference => reference.Start).First())
-            .ToList();
-        var sequences = Sequence.Matches(text).Select(match => new SequenceReference(match.Groups["name"].Value, match.Index)).ToList();
-        var dynamic = ExecuteImmediateVariable.Matches(text).Select(match => match.Index).ToList();
-        return new SqlAnalysis(tables, procedures, sequences, dynamic);
+        lock (Gate)
+        {
+            var process = Process();
+            process.StandardInput.WriteLine(JsonSerializer.Serialize(new { text }));
+            process.StandardInput.Flush();
+            var response = process.StandardOutput.ReadLine();
+            if (response is null)
+            {
+                var error = process.StandardError.ReadToEnd();
+                _process = null;
+                throw new InvalidOperationException($"Oracle SQL parser stopped unexpectedly: {error}");
+            }
+            return JsonSerializer.Deserialize<SqlAnalysis>(response)
+                ?? throw new InvalidOperationException("Oracle SQL parser returned an empty analysis");
+        }
     }
 
-    static void AddTables(List<TableReference> tables, string text, Regex regex, string operation, string edgeType)
+    static Process Process()
     {
-        foreach (Match match in regex.Matches(text))
+        if (_process is { HasExited: false }) return _process;
+        var python = Environment.GetEnvironmentVariable("CODE_TREE_PYTHON")
+            ?? Environment.GetEnvironmentVariable("PYTHON")
+            ?? (OperatingSystem.IsWindows() ? "python" : "python3");
+        var script = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "package_support", "sql_analyzer_cli.py"));
+        if (!File.Exists(script)) throw new FileNotFoundException("Oracle SQL parser bridge not found", script);
+        _process = System.Diagnostics.Process.Start(new ProcessStartInfo
         {
-            var name = match.Groups["name"].Value;
-            if (Keywords.Contains(name)) continue;
-            var actualEdge = name.Contains('@', StringComparison.Ordinal) && edgeType == "READS" ? "REMOTE_READS" : edgeType;
-            tables.Add(new TableReference(name, operation, actualEdge, match.Groups["name"].Index, name.Contains('@', StringComparison.Ordinal)));
-        }
+            FileName = python,
+            ArgumentList = { script },
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        }) ?? throw new InvalidOperationException("Could not start Oracle SQL parser");
+        return _process;
     }
 }
 
@@ -1399,7 +1375,18 @@ public sealed class PackageBuilder
         => _metadata.TryGetValue(key, out var value) && value is not null && !string.IsNullOrWhiteSpace(value.ToString()) ? value.ToString()! : fallback;
 
     static string Json(Dictionary<string, object>? value)
-        => value is null || value.Count == 0 ? "{}" : JsonSerializer.Serialize(value.OrderBy(pair => pair.Key).ToDictionary(pair => pair.Key, pair => pair.Value));
+    {
+        if (value is null || value.Count == 0) return "{}";
+        var options = new JsonSerializerOptions {
+            ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles,
+            MaxDepth = 64
+        };
+        try {
+            return JsonSerializer.Serialize(value.OrderBy(pair => pair.Key).ToDictionary(pair => pair.Key, pair => pair.Value), options);
+        } catch (Exception ex) {
+            return JsonSerializer.Serialize(new { error = "Serialization failed", message = ex.Message });
+        }
+    }
 
     static string Sha256(string value) => Sha256(Encoding.UTF8.GetBytes(value));
     static string Sha256(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();

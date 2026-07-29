@@ -3,11 +3,13 @@
     "main": [
       "CALLS_API", "STARTS", "CALLS", "READS", "REMOTE_READS", "INSERTS", "UPDATES",
       "DELETES", "MERGES", "WRITES", "READS_COLUMN", "WRITES_COLUMN", "DERIVES_FROM",
-      "POPULATES", "TRIGGERS", "DEPENDS_ON", "USES"
+      "POPULATES", "TRIGGERS", "DEPENDS_ON", "USES", "IMPLEMENTS", "INJECTS",
+      "RETURNS", "THROWS", "ROUTES_TO", "HANDLES_API", "READS_FROM", "WRITES_TO",
+      "USES_SEQUENCE", "EXECUTES_SQL", "LOADS_INTO", "MAPS_TO", "TRIGGERS_JOB"
     ],
     "structural_technical": [
       "CONTAINS", "HANDLED_BY", "ENTRY_IN", "RESOLVES_TO", "NAVIGATES_TO",
-      "BELONGS_TO", "PROJECT_REFERENCE"
+      "BELONGS_TO", "PROJECT_REFERENCE", "DEFINES_STATEMENT", "INCLUDES_FRAGMENT"
     ]
   },
   "graph_layers": ["STRUCTURAL", "TECHNICAL", "DATA_FLOW"],
@@ -17,12 +19,12 @@
   },
   "expansion_semantics": {
     "W": {
-      "terminal_edge_types": ["INSERTS", "UPDATES", "DELETES", "MERGES", "WRITES"],
-      "intermediate_edge_types": ["CALLS_API", "STARTS", "CALLS", "TRIGGERS", "HANDLED_BY", "ENTRY_IN", "RESOLVES_TO"]
+      "terminal_edge_types": ["INSERTS", "UPDATES", "DELETES", "MERGES", "WRITES", "WRITES_TO", "LOADS_INTO"],
+      "intermediate_edge_types": ["CALLS_API", "STARTS", "CALLS", "TRIGGERS", "TRIGGERS_JOB", "HANDLED_BY", "HANDLES_API", "ENTRY_IN", "RESOLVES_TO", "EXECUTES_SQL"]
     },
     "R": {
-      "terminal_edge_types": ["READS", "REMOTE_READS"],
-      "intermediate_edge_types": ["CALLS_API", "STARTS", "CALLS", "TRIGGERS", "HANDLED_BY", "ENTRY_IN", "RESOLVES_TO"]
+      "terminal_edge_types": ["READS", "REMOTE_READS", "READS_FROM"],
+      "intermediate_edge_types": ["CALLS_API", "STARTS", "CALLS", "TRIGGERS", "TRIGGERS_JOB", "HANDLED_BY", "HANDLES_API", "ENTRY_IN", "RESOLVES_TO", "EXECUTES_SQL"]
     }
   },
   "identity_fields": ["source_node_id", "edge_type", "target_node_id", "raw_operation", "graph_layer"]

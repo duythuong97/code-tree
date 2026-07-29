@@ -5,7 +5,13 @@ import re
 from dataclasses import dataclass
 
 from code_tree_exporter.contract.graph_contract import column_id, table_id
-from code_tree_exporter.extractors.package_support.package_writer import Catalog, PackageBuilder, leaf_identifier, line_text
+from code_tree_exporter.extractors.package_support.package_writer import (
+    Catalog,
+    PackageBuilder,
+    leaf_identifier,
+    line_text,
+    unresolved_id,
+)
 from code_tree_exporter.extractors.package_support.semantic_tree_v3 import analysis_notes
 
 _IDENTIFIER = r'(?:"(?:[^"]|"")+"|[A-Za-z_][\w$#]*)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[A-Za-z_][\w$#]*))?'
@@ -329,10 +335,49 @@ def extract_sql_loader(builder: PackageBuilder, catalog: Catalog, sql_id: str, t
     for target in control.targets:
         table_name = leaf_identifier(target.table)
         target_id = table_id(database, table_name)
-        edge_type = "INSERTS" if target.mode in {"INSERT", "APPEND"} else "WRITES"
+        edge_type = "LOADS_INTO"
         if not catalog.has_table(database, table_name):
+            target_id = unresolved_id(database, f"TABLE:{table_name}")
+            builder.add_node(
+                target_id,
+                "UNRESOLVED_REFERENCE",
+                table_name,
+                f"{database}.{table_name}",
+                table_name,
+                database_key=database,
+                graph_role="TECHNICAL",
+                confidence=0.2,
+                properties={
+                    "database": database,
+                    "table": table_name,
+                    "raw_reference": target.table,
+                    "loader": "SQL*Loader",
+                },
+            )
+            edge_id = builder.add_edge(
+                sql_id,
+                target_id,
+                edge_type,
+                raw_operation=target.mode,
+                confidence=0.5,
+                properties={
+                    "loader": "SQL*Loader",
+                    "infile": control.infile,
+                    "resolution": "unresolved_literal",
+                },
+            )
+            builder.add_evidence(
+                "EDGE",
+                edge_id,
+                source_path,
+                target.line,
+                target.line,
+                "SQL_LOADER_CONTROL",
+                line_text(text, target.line),
+                confidence=0.5,
+            )
             builder.add_issue("TABLE_NOT_IMPORTED", "ERROR", "SQL*Loader target table is absent from authoritative catalog", source_node_id=sql_id, raw_reference=table_name, database_key=database, source_path=source_path, start_line=target.line)
-            ref_node_id = ""
+            ref_node_id = target_id
         else:
             edge_id = builder.add_edge(sql_id, target_id, edge_type, raw_operation=target.mode, properties={"loader": "SQL*Loader", "infile": control.infile})
             builder.add_evidence("EDGE", edge_id, source_path, target.line, target.line, "SQL_LOADER_CONTROL", line_text(text, target.line))
@@ -353,14 +398,60 @@ def extract_sql_loader(builder: PackageBuilder, catalog: Catalog, sql_id: str, t
             fact["ref_node_id"] = ref_node_id
         steps.append(fact)
         for field in target.fields:
-            if field.filler or not catalog.has_table(database, table_name):
+            if field.filler:
                 continue
             mapping = {key: value for key, value in {"sourceField": field.source_field, "targetColumn": field.column, "position": field.position, "datatype": field.datatype, "transform": field.transform, "constant": field.constant, "loadMode": target.mode}.items() if value}
-            if not catalog.has_column(database, table_name, field.column):
+            resolved_column = (
+                catalog.has_table(database, table_name)
+                and catalog.has_column(database, table_name, field.column)
+            )
+            if resolved_column:
+                column_target = column_id(database, table_name, field.column)
+                confidence = 1.0
+            else:
+                column_target = unresolved_id(
+                    database, f"COLUMN:{table_name}:{field.column}"
+                )
+                owner = builder.nodes[sql_id]
+                builder.add_node(
+                    column_target,
+                    "UNRESOLVED_REFERENCE",
+                    field.column,
+                    f"{database}.{table_name}.{field.column}",
+                    field.column,
+                    system_key=owner.get("system_key", ""),
+                    database_key=database,
+                    repository_key=owner.get("repository_key", ""),
+                    graph_role="TECHNICAL",
+                    confidence=0.2,
+                    properties={
+                        "database": database,
+                        "table": table_name,
+                        "column": field.column,
+                        "loader": "SQL*Loader",
+                    },
+                )
                 builder.add_issue("COLUMN_NOT_IMPORTED", "ERROR", "SQL*Loader target column is absent from authoritative catalog", source_node_id=sql_id, raw_reference=f"{table_name}.{field.column}", database_key=database, source_path=source_path, start_line=field.line)
-                continue
-            edge_id = builder.add_edge(sql_id, column_id(database, table_name, field.column), "WRITES_COLUMN", raw_operation="FIELD_MAP", properties=mapping)
-            builder.add_evidence("EDGE", edge_id, source_path, field.line, field.line, "SQL_LOADER_CONTROL", line_text(text, field.line))
+                confidence = 0.5
+                mapping["resolution"] = "unresolved_literal"
+            edge_id = builder.add_edge(
+                sql_id,
+                column_target,
+                "MAPS_TO",
+                raw_operation="FIELD_MAP",
+                confidence=confidence,
+                properties=mapping,
+            )
+            builder.add_evidence(
+                "EDGE",
+                edge_id,
+                source_path,
+                field.line,
+                field.line,
+                "SQL_LOADER_CONTROL",
+                line_text(text, field.line),
+                confidence=confidence,
+            )
     for line, message in control.errors:
         builder.add_issue("PARSE_ERROR", "ERROR", message, source_node_id=sql_id, raw_reference=line_text(text, line), database_key=database, source_path=source_path, start_line=line)
     properties["semantic_tree"] = {

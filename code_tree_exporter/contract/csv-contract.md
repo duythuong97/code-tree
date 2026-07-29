@@ -1,4 +1,7 @@
-# CSV Graph Contract
+# Internal CSV Extractor Interchange Contract
+
+This format is used only between extractor subprocesses and the pipeline. Final
+generated output uses `graph.sqlite`; see `sqlite-contract.md`.
 
 UTF-8, comma-delimited, RFC 4180 quoting. Header names and order are exact. Empty optional values are empty fields. IDs are deterministic and case-sensitive. `confidence` is a decimal in `0..1`. `properties_json` is a JSON object; use `{}` when empty. Paths are repository-relative `/` paths without `.` or `..` segments.
 
@@ -60,15 +63,9 @@ Packages may omit this file entirely. When present, `files.localized_texts`, `st
 
 ## Manifest
 
-`manifest.json` must validate against `json-schemas/manifest.schema.json`.
-
-Compatibility decision for this repo:
-
-- Generated packages use `contractVersion: "1.1"`. Each `files` value is one CSV filename or an ordered list of lossless CSV chunks. Every checksum records SHA-256, bytes, and data-row count.
-- Importers remain compatible with `contractVersion: "1.0"` single-file manifests. `localized_texts` remains optional.
-- The former additive `contractVersion: "2.0.0"` manifest shape remains unsupported.
-
-Counts/statistics are non-negative integers and describe all published rows across chunks. Production packages include a checksum for every declared CSV chunk.
+Extractor staging manifests use `contractVersion: "1.0"` and map each table name
+to one CSV filename. The public `json-schemas/manifest.schema.json` describes the
+final SQLite output and does not validate these temporary manifests.
 
 Validator scope required by sections 6-9 and 21:
 

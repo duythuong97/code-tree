@@ -55,14 +55,27 @@ def run_pipeline(config_path: Path) -> Path:
     sources = config.get("sources")
     if not isinstance(sources, list) or not sources:
         raise ValueError("sources must be a non-empty array")
-    validated_sources = [_validate_source(source, index) for index, source in enumerate(sources)]
+    validated_sources = [
+        _validate_source(source, index) for index, source in enumerate(sources)
+    ]
     source_names = [str(source["name"]) for source in validated_sources]
     if len(source_names) != len(set(source_names)):
         raise ValueError("sources[].name must be unique")
     _validate_data_paths(config, validated_sources, output)
     validate_output_directory(output)
     default_encoding = str(config.get("defaultEncoding", "auto"))
+    output_mode = str(config.get("outputMode", "flat")).strip().lower()
+    if output_mode not in {"flat", "partitioned"}:
+        raise ValueError("outputMode must be 'flat' or 'partitioned'")
+    limits = _resolved_limits(config)
     graph = GraphPackage()
+    for source in validated_sources:
+        graph.register_source(
+            str(source["name"]),
+            str(source["type"]),
+            str(source.get("system") or source["name"]),
+            str(source.get("repository") or source["name"]),
+        )
     staging_parent = output.parent
     staging_parent.mkdir(parents=True, exist_ok=True)
 
@@ -78,11 +91,18 @@ def run_pipeline(config_path: Path) -> Path:
             source_type = str(source["type"])
             spec = extractor_spec(source_type)
             source_name = str(source["name"])
+            prepared_source_root = prepared_root / source_name
             source_records, valid_paths = _prepare_source(
-                root, prepared_root / source_name, source, spec, default_encoding, graph
+                root,
+                prepared_source_root,
+                source,
+                spec,
+                default_encoding,
+                graph,
+                max_file_bytes=limits["maxFileBytes"],
             )
             if spec.config_type == "angular":
-                _copy_angular_metadata(root, prepared_root / source_name, source)
+                _copy_angular_metadata(root, prepared_source_root, source)
             for record in source_records:
                 graph.add_source(record)
             if not valid_paths:
@@ -90,14 +110,30 @@ def run_pipeline(config_path: Path) -> Path:
                     "PARSE_ERROR",
                     f"No decodable supported files for source {source_name}",
                     severity="WARNING",
+                    properties={"source_key": source_name},
                 )
                 continue
             package_output = packages_root / source_name
+            semantic_project = spec.config_type in {
+                "angular",
+                "dotnet-api",
+                "dotnet-batch",
+            }
+            has_legacy_encoding = any(
+                record.actual_encoding.lower().replace("_", "-")
+                not in {"utf-8", "utf-8-sig", "ascii"}
+                for record in source_records
+            )
+            extractor_root = (
+                root
+                if semantic_project and not has_legacy_encoding
+                else prepared_source_root
+            )
             extractor_config = _extractor_config(
                 config,
                 source,
                 spec,
-                prepared_root / source_name,
+                extractor_root,
                 package_output,
                 valid_paths,
             )
@@ -107,7 +143,8 @@ def run_pipeline(config_path: Path) -> Path:
                 encoding="utf-8",
             )
             api_operations_before = sum(
-                node.get("node_type") == "API_OPERATION" for node in graph.nodes.values()
+                node.get("node_type") == "API_OPERATION"
+                for node in graph.nodes.values()
             )
             _run_extractor(spec, extractor_config_path, extractor_config, graph)
             if package_output.exists():
@@ -115,14 +152,21 @@ def run_pipeline(config_path: Path) -> Path:
             if (
                 spec.config_type == "dotnet-api"
                 and any(Path(path).suffix.lower() == ".cs" for path in valid_paths)
-                and sum(node.get("node_type") == "API_OPERATION" for node in graph.nodes.values())
+                and sum(
+                    node.get("node_type") == "API_OPERATION"
+                    for node in graph.nodes.values()
+                )
                 == api_operations_before
             ):
                 graph.add_issue(
                     "NO_API_ENDPOINTS",
                     "C# parsed; no supported ASP.NET controller or minimal API endpoint recognized",
                     severity="WARNING",
-                    source_path=next(path for path in valid_paths if Path(path).suffix.lower() == ".cs"),
+                    source_path=next(
+                        path
+                        for path in valid_paths
+                        if Path(path).suffix.lower() == ".cs"
+                    ),
                 )
             if spec.config_type in {"dotnet-api", "dotnet-batch"}:
                 _run_dotnet_xml_companion(
@@ -132,20 +176,30 @@ def run_pipeline(config_path: Path) -> Path:
                     graph,
                 )
 
-        graph.resolve_routine_references()
+        from .linker import run_linker
+
+        run_linker(graph)
         graph.materialize_structure()
         final_staging = temporary_root / "final"
         final_staging.mkdir()
-        max_tree_lines = _positive_int(config, "maxTreeLines", 20_000, minimum=10)
+        max_tree_lines = limits["maxTreeLines"]
         graph.write(
             final_staging,
             source_name=str(config.get("name") or root.name),
             config_path=str(config_path),
-            max_csv_rows=_positive_int(config, "maxCsvRows", 1_000_000),
-            max_csv_bytes=_positive_int(config, "maxCsvBytes", 8 * 1024 * 1024, minimum=1024),
+            output_mode=output_mode,
+            knowledge_chunking=(
+                config.get("knowledgeChunking")
+                if isinstance(config.get("knowledgeChunking"), dict)
+                else {}
+            ),
+            max_evidence_snippet_chars=limits["maxEvidenceSnippetChars"],
+            max_issues_per_type_per_file=limits["maxIssuesPerTypePerFile"],
         )
+
         render_file_tree(graph, final_staging / "file-trees", max_tree_lines)
-        render_system_tree(graph, final_staging / "SYSTEM_TREE.md", max_tree_lines)
+        if config.get("combinedProjection", output_mode == "flat"):
+            render_system_tree(graph, final_staging / "SYSTEM_TREE.md", max_tree_lines)
         replace_directory(final_staging, output)
     return output
 
@@ -159,13 +213,22 @@ def _load_config(path: Path) -> dict:
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("Config root must be an object")
-    owners = [value, *(item for item in value.get("sources", []) if isinstance(item, dict))]
+    owners = [
+        value,
+        *(item for item in value.get("sources", []) if isinstance(item, dict)),
+    ]
     for owner in owners:
         for key in ("root", "output", "inputData"):
             configured = owner.get(key)
             if isinstance(configured, str) and configured:
                 candidate = Path(configured).expanduser()
-                owner[key] = str((candidate if candidate.is_absolute() else path.parent / candidate).resolve())
+                owner[key] = str(
+                    (
+                        candidate
+                        if candidate.is_absolute()
+                        else path.parent / candidate
+                    ).resolve()
+                )
     return value
 
 
@@ -198,17 +261,49 @@ def _positive_int(config: dict, key: str, default: int, *, minimum: int = 1) -> 
         raise ValueError(f"{key} must be an integer >= {minimum}")
     return result
 
+
+def _resolved_limits(config: dict) -> dict[str, int]:
+    configured = config.get("limits")
+    limits = configured if isinstance(configured, dict) else {}
+
+    def value(key: str, default: int, minimum: int = 1) -> int:
+        owner = {key: limits.get(key, config.get(key, default))}
+        return _positive_int(owner, key, default, minimum=minimum)
+
+    return {
+        "maxTreeLines": value("maxTreeLines", 20_000, 10),
+        "maxFileBytes": value("maxFileBytes", 10 * 1024 * 1024, 1024),
+        "maxEvidenceSnippetChars": value("maxEvidenceSnippetChars", 500),
+        "maxIssuesPerTypePerFile": value("maxIssuesPerTypePerFile", 20),
+        "extractorTimeoutSeconds": value("extractorTimeoutSeconds", 300),
+        "projectTimeoutSeconds": value("projectTimeoutSeconds", 900),
+        "maxWorkerProcesses": value("maxWorkerProcesses", 4),
+    }
+
+
 def _validate_data_paths(config: dict, sources: list[dict], output: Path) -> None:
     output = output.resolve()
     managed_paths = (output, output.with_name(output.name + ".previous"))
-    owners = [(config, "inputData"), *((source, f"sources[{index}].inputData") for index, source in enumerate(sources))]
+    owners = [
+        (config, "inputData"),
+        *(
+            (source, f"sources[{index}].inputData")
+            for index, source in enumerate(sources)
+        ),
+    ]
     for owner, label in owners:
         value = owner.get("inputData")
         if not isinstance(value, str) or not value:
             continue
         candidate = Path(value).resolve()
-        if any(candidate == managed or managed in candidate.parents for managed in managed_paths):
-            raise ValueError(f"{label} must be outside output and output.previous: {candidate}")
+        if any(
+            candidate == managed or managed in candidate.parents
+            for managed in managed_paths
+        ):
+            raise ValueError(
+                f"{label} must be outside output and output.previous: {candidate}"
+            )
+
 
 def _validate_source(value: object, index: int) -> dict:
     if not isinstance(value, dict):
@@ -220,8 +315,19 @@ def _validate_source(value: object, index: int) -> dict:
         raise ValueError(f"sources[{index}].folders must be a non-empty array")
     name = str(value["name"])
     invalid_name_chars = '<>:"/\\|?*'
-    reserved_names = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
-    if name in {"", ".", ".."} or any(char in name for char in invalid_name_chars) or name.rstrip(". ").upper() in reserved_names:
+    reserved_names = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+    if (
+        name in {"", ".", ".."}
+        or any(char in name for char in invalid_name_chars)
+        or name.rstrip(". ").upper() in reserved_names
+    ):
         raise ValueError(f"sources[{index}].name is unsafe: {name!r}")
     return value
 
@@ -233,6 +339,8 @@ def _prepare_source(
     spec: ExtractorSpec,
     default_encoding: str,
     graph: GraphPackage,
+    *,
+    max_file_bytes: int,
 ) -> tuple[list[SourceRecord], list[str]]:
     selected = _selected_files(root, source["folders"], spec.suffixes)
     if spec.config_type in {"dotnet-api", "dotnet-batch"}:
@@ -243,6 +351,29 @@ def _prepare_source(
     for path in selected:
         relative = path.relative_to(root).as_posix()
         try:
+            file_size = path.stat().st_size
+        except OSError as exc:
+            graph.add_issue(
+                "PARSE_ERROR",
+                f"Unable to inspect source file: {exc}",
+                source_path=relative,
+                properties={"source_key": str(source["name"])},
+            )
+            continue
+        if file_size > max_file_bytes:
+            graph.add_issue(
+                "FILE_TOO_LARGE",
+                f"Source file is {file_size} bytes; limit is {max_file_bytes}",
+                source_path=relative,
+                severity="WARNING",
+                properties={
+                    "source_key": str(source["name"]),
+                    "bytes": file_size,
+                    "max_file_bytes": max_file_bytes,
+                },
+            )
+            continue
+        try:
             decoded = decode_source(
                 path, relative, encoding_for(relative, source, default_encoding)
             )
@@ -251,9 +382,13 @@ def _prepare_source(
                 exc.issue_type,
                 str(exc),
                 source_path=exc.path,
-                properties=exc.properties,
+                properties={
+                    **exc.properties,
+                    "source_key": str(source["name"]),
+                },
             )
             continue
+
         destination = staging / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(decoded.text, encoding="utf-8", newline="")
@@ -315,19 +450,31 @@ def _selected_files(root: Path, folders: list, suffixes: tuple[str, ...]) -> lis
 
 def _expand_dotnet_selection(root: Path, selected: list[Path]) -> list[Path]:
     result = set(selected)
-    projects: list[Path] = [path for path in selected if path.suffix.lower() == ".csproj"]
+    projects: list[Path] = [
+        path for path in selected if path.suffix.lower() == ".csproj"
+    ]
     seen_projects: set[Path] = set()
     for solution in (path for path in selected if path.suffix.lower() == ".sln"):
-        for match in re.finditer(r'Project\([^)]*\)\s*=\s*"[^"\r\n]+"\s*,\s*"(?P<path>[^"\r\n]+\.csproj)"', solution.read_text(encoding="utf-8"), re.IGNORECASE):
-            projects.append((solution.parent / match.group("path").replace("\\", "/")).resolve())
+        for match in re.finditer(
+            r'Project\([^)]*\)\s*=\s*"[^"\r\n]+"\s*,\s*"(?P<path>[^"\r\n]+\.csproj)"',
+            solution.read_text(encoding="utf-8"),
+            re.IGNORECASE,
+        ):
+            projects.append(
+                (solution.parent / match.group("path").replace("\\", "/")).resolve()
+            )
     while projects:
         project = projects.pop()
-        if project in seen_projects or not _safe_source_file(project, root, {".csproj"}):
+        if project in seen_projects or not _safe_source_file(
+            project, root, {".csproj"}
+        ):
             continue
         seen_projects.add(project)
         result.add(project)
         for path in project.parent.rglob("*"):
-            if _safe_source_file(path, root, {".cs", ".xml"}):
+            if _safe_source_file(
+                path, root, {".cs", ".xml", ".config", ".json"}
+            ):
                 result.add(path)
         try:
             project_xml = ElementTree.fromstring(project.read_text(encoding="utf-8"))
@@ -345,14 +492,19 @@ def _expand_dotnet_selection(root: Path, selected: list[Path]) -> list[Path]:
                 result.add(candidate)
     return sorted(result, key=lambda path: path.relative_to(root).as_posix())
 
+
 def _safe_source_file(path: Path, root: Path, suffixes: set[str]) -> bool:
     resolved = path.resolve()
     return (
         resolved.is_file()
         and (resolved == root or root in resolved.parents)
         and resolved.suffix.lower() in suffixes
-        and not (_BLOCKED_DIRECTORIES & {part.lower() for part in resolved.relative_to(root).parts})
+        and not (
+            _BLOCKED_DIRECTORIES
+            & {part.lower() for part in resolved.relative_to(root).parts}
+        )
     )
+
 
 def _copy_angular_metadata(root: Path, staging: Path, source: dict) -> None:
     root = root.resolve()
@@ -362,23 +514,66 @@ def _copy_angular_metadata(root: Path, staging: Path, source: dict) -> None:
         candidate = (root / str(relative)).resolve()
         current = candidate.parent if candidate.is_file() else candidate
         while current == root or root in current.parents:
-            angular_json = current / "angular.json"
-            if angular_json.is_file():
-                pending.extend((angular_json, current / "tsconfig.json", current / "tsconfig.app.json"))
+            workspace_path = next(
+                (
+                    current / name
+                    for name in (
+                        "angular.json",
+                        ".angular-cli.json",
+                        "angular-cli.json",
+                    )
+                    if (current / name).is_file()
+                ),
+                None,
+            )
+            if workspace_path is not None:
+                pending.extend(
+                    (
+                        workspace_path,
+                        current / "package.json",
+                        current / "tsconfig.json",
+                        current / "tsconfig.app.json",
+                    )
+                )
                 try:
-                    workspace = json.loads(angular_json.read_text(encoding="utf-8"))
+                    workspace = json.loads(
+                        workspace_path.read_text(encoding="utf-8")
+                    )
                 except (OSError, json.JSONDecodeError):
                     workspace = {}
-                projects = workspace.get("projects", {}) if isinstance(workspace, dict) else {}
+                projects = (
+                    workspace.get("projects", {}) if isinstance(workspace, dict) else {}
+                )
                 for project in projects.values() if isinstance(projects, dict) else ():
                     if not isinstance(project, dict):
                         continue
                     targets = project.get("architect") or project.get("targets") or {}
                     for target in targets.values() if isinstance(targets, dict) else ():
-                        options = target.get("options", {}) if isinstance(target, dict) else {}
-                        tsconfig = options.get("tsConfig") if isinstance(options, dict) else None
+                        options = (
+                            target.get("options", {})
+                            if isinstance(target, dict)
+                            else {}
+                        )
+                        tsconfig = (
+                            options.get("tsConfig")
+                            if isinstance(options, dict)
+                            else None
+                        )
                         if isinstance(tsconfig, str):
                             pending.append((current / tsconfig).resolve())
+                applications = (
+                    workspace.get("apps", [])
+                    if isinstance(workspace, dict)
+                    else []
+                )
+                for application in (
+                    applications if isinstance(applications, list) else ()
+                ):
+                    if not isinstance(application, dict):
+                        continue
+                    tsconfig = application.get("tsconfig")
+                    if isinstance(tsconfig, str):
+                        pending.append((current / tsconfig).resolve())
                 break
             if current == root:
                 break
@@ -391,19 +586,28 @@ def _copy_angular_metadata(root: Path, staging: Path, source: dict) -> None:
     copied: set[Path] = set()
     while pending:
         candidate = pending.pop().resolve()
-        if candidate in copied or not candidate.is_file() or not (candidate == root or root in candidate.parents):
+        if (
+            candidate in copied
+            or not candidate.is_file()
+            or not (candidate == root or root in candidate.parents)
+        ):
             continue
         copied.add(candidate)
         destination = staging / candidate.relative_to(root)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(candidate, destination)
-        if candidate.name.startswith("tsconfig") and candidate.suffix.lower() == ".json":
+        if (
+            candidate.name.startswith("tsconfig")
+            and candidate.suffix.lower() == ".json"
+        ):
             try:
                 metadata = json.loads(candidate.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             extends = metadata.get("extends") if isinstance(metadata, dict) else None
-            if isinstance(extends, str) and (extends.startswith(".") or Path(extends).is_absolute()):
+            if isinstance(extends, str) and (
+                extends.startswith(".") or Path(extends).is_absolute()
+            ):
                 parent = (candidate.parent / extends).resolve()
                 pending.append(parent if parent.suffix else parent.with_suffix(".json"))
 
@@ -439,6 +643,7 @@ def _extractor_config(
             ),
         }
     )
+    result["limits"] = _resolved_limits(global_config)
     result["folders"] = _staged_folders(source["folders"])
     if spec.config_type == "angular":
         result.setdefault("appConfig", "")
@@ -483,6 +688,7 @@ def _run_dotnet_xml_companion(
     }
     extract(xml_config)
     graph.merge_directory(output)
+
 
 def _is_sql_mapper(path: Path) -> bool:
     try:
@@ -543,36 +749,91 @@ def _run_extractor(
                 "TYPESCRIPT_PATH", str(config.get("_typescriptPath") or "typescript")
             )
         else:
-            command = [sys.executable, str(spec.script.with_name("main.py")), "--config", str(config_path)]
+            command = [
+                sys.executable,
+                str(spec.script.with_name("main.py")),
+                "--config",
+                str(config_path),
+            ]
             env["CODEMAP_USE_LEGACY_SCANNERS"] = "1"
     else:
         command = [sys.executable, str(spec.script), "--config", str(config_path)]
+    limits = config.get("limits") if isinstance(config.get("limits"), dict) else {}
+    timeout = int(limits.get("extractorTimeoutSeconds", 300))
     try:
-        completed = subprocess.run(command, env=env, text=True, capture_output=True)
+        completed = subprocess.run(
+            command,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
     except FileNotFoundError as exc:
         if spec.config_type != "angular":
-            graph.add_issue("PARSE_ERROR", f"{spec.config_type} extractor dependency missing: {exc}")
+            graph.add_issue(
+                "PARSE_ERROR",
+                f"{spec.config_type} extractor dependency missing: {exc}",
+                properties={"source_key": str(config.get("source") or "")},
+            )
             return
         completed = subprocess.CompletedProcess(command, 127, "", str(exc))
+    except subprocess.TimeoutExpired:
+        graph.add_issue(
+            "TIMEOUT",
+            f"{spec.config_type} extractor exceeded {timeout} seconds",
+            severity="WARNING",
+            properties={
+                "timeout_seconds": timeout,
+                "source_key": str(config.get("source") or ""),
+            },
+        )
+        return
     if completed.returncode and spec.config_type == "angular":
-        primary_message = (completed.stderr or completed.stdout or "Angular TypeScript parser failed").strip()
+        primary_message = _bounded_subprocess_message(
+            completed, "Angular TypeScript parser failed"
+        )
         graph.add_issue(
             "SEMANTIC_TREE_UNAVAILABLE",
             f"Angular TypeScript parser unavailable; degraded regex fallback used: {primary_message}",
             severity="WARNING",
+            properties={"source_key": str(config.get("source") or "")},
         )
         fallback = spec.script.with_name("main.py")
-        completed = subprocess.run(
-            [sys.executable, str(fallback), "--config", str(config_path)],
-            env={**env, "CODEMAP_USE_LEGACY_SCANNERS": "1"},
-            text=True,
-            capture_output=True,
-        )
+        if fallback.is_file():
+            try:
+                completed = subprocess.run(
+                    [sys.executable, str(fallback), "--config", str(config_path)],
+                    env={**env, "CODEMAP_USE_LEGACY_SCANNERS": "1"},
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                graph.add_issue(
+                    "TIMEOUT",
+                    f"Angular fallback extractor exceeded {timeout} seconds",
+                    severity="WARNING",
+                    properties={
+                        "timeout_seconds": timeout,
+                        "source_key": str(config.get("source") or ""),
+                    },
+                )
+                return
     if completed.returncode:
-        message = (completed.stderr or completed.stdout or "Extractor failed").strip()
+        message = _bounded_subprocess_message(completed, "Extractor failed")
         graph.add_issue(
-            "PARSE_ERROR", f"{spec.config_type} extractor failed: {message}"
+            "PARSE_ERROR",
+            f"{spec.config_type} extractor failed: {message}",
+            properties={"source_key": str(config.get("source") or "")},
         )
+
+
+def _bounded_subprocess_message(
+    completed: subprocess.CompletedProcess[str], fallback: str
+) -> str:
+    message = (completed.stderr or completed.stdout or fallback).strip()
+    maximum = 16_000
+    return message if len(message) <= maximum else message[: maximum - 1] + "…"
 
 
 def _typescript_path(root: Path) -> str:

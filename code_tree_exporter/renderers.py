@@ -4,7 +4,6 @@ import json
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
-from .contract.graph_contract import stable_node_id
 from .graph_package import GraphPackage
 
 _FACT_CHILD_GROUPS = (
@@ -50,13 +49,35 @@ def render_file_tree(package: GraphPackage, output: Path, max_lines: int = 20_00
     ]
     collisions = {path for path in output_paths if output_paths.count(path) > 1}
     for record, relative_output in zip(records, output_paths):
+        nodes_in_file = {
+            evidence["target_id"]
+            for evidence in package.evidence.values()
+            if evidence.get("target_type") == "NODE" and evidence.get("source_path") == record.relative_path
+        }
+
+        local_comments = sorted(
+            (comment for comment in package.comments.values() if comment["source_path"] == record.relative_path),
+            key=lambda item: (_line(item), item["comment_id"]),
+        )
+
+        if not nodes_in_file:
+            continue
+
+        file_root_nodes = []
+        for node_id in nodes_in_file:
+            is_child = any(
+                node_id in children.get(parent_id, [])
+                for parent_id in nodes_in_file
+            )
+            if not is_child:
+                file_root_nodes.append(node_id)
+
         lines = [f"# File Tree: {record.relative_path}", ""]
-        file_id = stable_node_id("file", record.source_key, record.relative_path)
         lines.append(
             f"- FILE: `{record.relative_path}` [{record.actual_encoding}; {record.newline_style}]"
         )
         for node_id in sorted(
-            children.get(file_id, []),
+            file_root_nodes,
             key=lambda value: _node_order(value, package, declarations),
         ):
             _render_node(
@@ -72,10 +93,6 @@ def render_file_tree(package: GraphPackage, output: Path, max_lines: int = 20_00
                 frozenset(),
                 record.relative_path,
             )
-        local_comments = sorted(
-            (comment for comment in package.comments.values() if comment["source_path"] == record.relative_path),
-            key=lambda item: (_line(item), item["comment_id"]),
-        )
         if local_comments:
             counts: dict[str, int] = defaultdict(int)
             for comment in local_comments:
@@ -85,7 +102,7 @@ def render_file_tree(package: GraphPackage, output: Path, max_lines: int = 20_00
                     classification = "OTHER"
                 counts[str(classification)] += 1
             summary = ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
-            lines.append(f"  - COMMENTS: {len(local_comments)} [{summary}] (full text: manifest files.comments)")
+            lines.append(f"  - COMMENTS: {len(local_comments)} [{summary}] (full text: graph.sqlite comments)")
         if relative_output in collisions:
             relative_output = PurePosixPath(record.relative_path + ".md")
         target = output.joinpath(*relative_output.parts)
@@ -283,5 +300,5 @@ def _limited_text(lines: list[str], max_lines: int) -> str:
     if max_lines < 10:
         raise ValueError("maxTreeLines must be at least 10")
     if len(lines) > max_lines:
-        lines = lines[: max_lines - 2] + ["", "_Projection truncated; use manifest CSV files for the complete graph._"]
+        lines = lines[: max_lines - 2] + ["", "_Projection truncated; query graph.sqlite for the complete graph._"]
     return "\n".join(lines).rstrip() + "\n"

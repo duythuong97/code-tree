@@ -145,8 +145,15 @@ foreach (var executable in executables.OrderBy(exe => exe.Name, StringComparer.O
         switch (finding)
         {
             case DataEdgeFinding edge:
-                var edgeId = builder.AddEdge(sourceNode, edge.TargetNodeId, edge.EdgeType, rawOperation: edge.RawOperation);
-                builder.AddEvidence("EDGE", edgeId, edge.File.RelativePath, edge.Line, edge.Line, edge.EvidenceKind, edge.Snippet);
+                var targetNodeId = string.IsNullOrEmpty(edge.RawReference)
+                    ? edge.TargetNodeId
+                    : EnsureTableReference(builder, edge.Database, systemKey, repository, edge.RawReference);
+                var confidence = string.IsNullOrEmpty(edge.RawReference) ? 1.0 : 0.5;
+                var edgeProperties = string.IsNullOrEmpty(edge.RawReference)
+                    ? null
+                    : new Dictionary<string, object> { ["resolution"] = "deferred_global" };
+                var edgeId = builder.AddEdge(sourceNode, targetNodeId, edge.EdgeType, rawOperation: edge.RawOperation, confidence: confidence, properties: edgeProperties);
+                builder.AddEvidence("EDGE", edgeId, edge.File.RelativePath, edge.Line, edge.Line, edge.EvidenceKind, edge.Snippet, confidence: confidence);
                 break;
             case ProcedureFinding procedure:
                 var procedureId = EnsureProcedureReference(builder, procedure.Database, systemKey, repository, source, procedure.RawReference);
@@ -156,7 +163,7 @@ foreach (var executable in executables.OrderBy(exe => exe.Name, StringComparer.O
             case SequenceFinding sequence:
                 var sequenceId = ExtractorRuntime.SequenceId(sequence.Database, sequence.SequenceName);
                 builder.AddNode(sequenceId, "SEQUENCE", sequence.SequenceName, $"{sequence.Database}.{sequence.SequenceName}", sequence.SequenceName, systemKey, sequence.Database, repository, "TECHNICAL");
-                builder.AddEdge(sourceNode, sequenceId, "USES", rawOperation: "NEXTVAL");
+                builder.AddEdge(sourceNode, sequenceId, "USES", rawOperation: sequence.Operation);
                 break;
             case IssueFinding issue:
                 builder.AddIssue(issue.IssueType, issue.Severity, issue.Message, sourceNode, issue.RawReference, issue.Database, issue.File.RelativePath, issue.Line, issue.Properties);
@@ -216,10 +223,10 @@ static List<ProjectInfo> DiscoverProjects(List<SourceFile> files, List<SourceFil
         var relativePath = ExtractorRuntime.RepositoryPath(Path.GetRelativePath(root, file.AbsolutePath));
         var directory = Path.GetDirectoryName(file.AbsolutePath) ?? root;
         var projectFiles = csFiles.Where(source => IsUnderDirectory(source.AbsolutePath, directory)).ToList();
-        var outputType = ProjectProperty(file.Text, "OutputType");
-        var assemblyName = ProjectProperty(file.Text, "AssemblyName");
+        var outputType = MsBuildProjectXml.Property(file.Text, "OutputType");
+        var assemblyName = MsBuildProjectXml.Property(file.Text, "AssemblyName");
         if (string.IsNullOrWhiteSpace(assemblyName)) assemblyName = Path.GetFileNameWithoutExtension(file.AbsolutePath);
-        var targetName = ProjectProperty(file.Text, "TargetName");
+        var targetName = MsBuildProjectXml.Property(file.Text, "TargetName");
         if (string.IsNullOrWhiteSpace(targetName)) targetName = assemblyName;
         var hasEntry = projectFiles.Any(HasMainOrTopLevelStatements);
         var explicitlyLibrary = outputType.Equals("Library", StringComparison.OrdinalIgnoreCase);
@@ -447,6 +454,24 @@ static string EnsureProcedureReference(PackageBuilder builder, string database, 
     return nodeId;
 }
 
+static string EnsureTableReference(PackageBuilder builder, string database, string systemKey, string repository, string rawReference)
+{
+    var raw = rawReference.Trim().ToUpperInvariant();
+    var parts = raw.Split('.', StringSplitOptions.RemoveEmptyEntries);
+    var schema = parts.Length >= 2 ? parts[^2] : "";
+    var table = ExtractorRuntime.LeafIdentifier(raw);
+    var identity = string.IsNullOrEmpty(schema) ? $"TABLE:{table}" : $"TABLE:{schema}:{table}";
+    var nodeId = ExtractorRuntime.StableNodeId("unresolved-reference", database, identity);
+    builder.AddNode(nodeId, "UNRESOLVED_REFERENCE", table, string.IsNullOrEmpty(schema) ? $"{database}.{table}" : $"{database}.{schema}.{table}", table, systemKey, database, repository, "TECHNICAL", confidence: 0.2, properties: new Dictionary<string, object>
+    {
+        ["database"] = database,
+        ["schema"] = schema,
+        ["table"] = table,
+        ["raw_reference"] = raw,
+    });
+    return nodeId;
+}
+
 static List<DataFinding> CollectDataFindings(List<SourceFile> csFiles, IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilationByTree, Catalog catalog, List<FolderContext> folderContexts, string defaultDatabase, IReadOnlyDictionary<MethodKey, MethodDeclarationInfo> methods)
 {
     var findings = new List<DataFinding>();
@@ -458,39 +483,69 @@ static List<DataFinding> CollectDataFindings(List<SourceFile> csFiles, IReadOnly
         {
             var owner = CanonicalKey(OwnerForOffset(file, expression.Start), methods);
             if (string.IsNullOrEmpty(owner.ClassName) || string.IsNullOrEmpty(owner.MemberName)) continue;
+            if (!IsLikelySql(expression.Value)) continue;
             var line = ExtractorRuntime.LineForOffset(file, expression.Start);
             var snippet = ExtractorRuntime.LineText(file, line);
-            if (IsStoredProcedureLiteral(file.Text, expression.Value))
+            SqlAnalysis analysis;
+            try
             {
-                var raw = expression.Value.Trim().ToUpperInvariant();
-                var procKey = raw.Contains('.') ? string.Join('.', raw.Split('.').TakeLast(2)) : raw;
-                findings.Add(new ProcedureFinding(owner, raw, procKey.Split('.').Last(), file, line, "STORED_PROCEDURE", snippet, database));
+                analysis = SqlAnalyzer.Analyze(expression.Value);
+            }
+            catch (Exception exception)
+            {
+                var detail = exception.Message.Length <= 1000 ? exception.Message : exception.Message[..1000];
+                findings.Add(new IssueFinding(
+                    owner,
+                    "SQL_PARSE_ERROR",
+                    "WARNING",
+                    $"Embedded SQL parser unavailable: {detail}",
+                    expression.ExpressionText,
+                    file,
+                    line,
+                    database));
                 continue;
             }
-
-            var analysis = SqlAnalyzer.Analyze(expression.Value);
-            if (expression.IsDynamic && LooksLikeSql(expression.Value) && (analysis.Tables.Count == 0 || HasDynamicSqlTarget(expression.Value) || analysis.DynamicOffsets.Count > 0))
-            {
+            if (!analysis.Recognized) continue;
+            if (expression.IsDynamic)
                 findings.Add(new IssueFinding(owner, "DYNAMIC_SQL", "WARNING", "Runtime SQL target cannot be resolved", expression.ExpressionText, file, line, database, new Dictionary<string, object> { ["expression"] = expression.ExpressionText, ["evaluated"] = expression.Value }));
-                if (HasDynamicSqlTarget(expression.Value)) continue;
-            }
+            foreach (var parseErrorOffset in analysis.ParseErrorOffsets)
+                findings.Add(new IssueFinding(owner, "SQL_PARSE_ERROR", "WARNING", "Embedded SQL could not be parsed completely", expression.ExpressionText, file, ExtractorRuntime.LineForOffset(file, expression.Start + parseErrorOffset), database));
             foreach (var tableRef in analysis.Tables)
             {
                 var tableName = ExtractorRuntime.LeafIdentifier(tableRef.ObjectName);
                 if (!catalog.HasTable(database, tableName))
                 {
+                    var unresolvedId = ExtractorRuntime.StableNodeId(
+                        "unresolved-reference",
+                        database,
+                        tableRef.ObjectName.Contains('.')
+                            ? $"TABLE:{string.Join(':', tableRef.ObjectName.ToUpperInvariant().Split('.', StringSplitOptions.RemoveEmptyEntries).TakeLast(2))}"
+                            : $"TABLE:{tableName}");
+                    findings.Add(new DataEdgeFinding(owner, unresolvedId, tableRef.EdgeType, tableRef.Operation, file, line, "SQL", snippet, database, tableRef.ObjectName));
                     findings.Add(new IssueFinding(owner, "TABLE_NOT_IMPORTED", "ERROR", "Table is absent from authoritative catalog", tableName, file, line, database));
                     continue;
                 }
                 findings.Add(new DataEdgeFinding(owner, ExtractorRuntime.TableId(database, tableName), tableRef.EdgeType, tableRef.Operation, file, line, "SQL", snippet, database));
             }
             foreach (var sequence in analysis.Sequences)
-                findings.Add(new SequenceFinding(owner, ExtractorRuntime.LeafIdentifier(sequence.ObjectName), file, line, database));
+                findings.Add(new SequenceFinding(owner, ExtractorRuntime.LeafIdentifier(sequence.ObjectName), sequence.Operation, file, line, database));
             foreach (var offset in analysis.DynamicOffsets)
                 findings.Add(new IssueFinding(owner, "DYNAMIC_SQL", "WARNING", "Runtime SQL target cannot be resolved", expression.ExpressionText, file, ExtractorRuntime.LineForOffset(file, expression.Start + offset), database));
         }
     }
     return findings;
+}
+
+static bool IsLikelySql(string text)
+{
+    if (string.IsNullOrWhiteSpace(text) || text.Length < 10) return false;
+    var upper = text.ToUpperInvariant();
+    return upper.Contains("SELECT ")
+        || upper.Contains("INSERT ")
+        || upper.Contains("UPDATE ")
+        || upper.Contains("DELETE ")
+        || upper.Contains("MERGE ")
+        || upper.Contains("EXEC ");
 }
 
 static IEnumerable<MethodKey> EntryMethodsForExecutable(ExecutableInfo executable, List<MethodDeclarationInfo> methods, List<SourceFile> csFiles)
@@ -529,21 +584,17 @@ static string NodeForMethod(MethodKey key, PackageBuilder builder, Dictionary<Me
     var classIdentity = string.IsNullOrEmpty(key.ClassIdentity)
         ? method is null ? string.Empty : $"{method.File.RelativePath}|{key.ClassName}"
         : key.ClassIdentity;
-    string? classId = null;
-    if (key.ClassName.EndsWith("Repository", StringComparison.Ordinal))
-    {
-        classId = ExtractorRuntime.StableNodeId("repository", repository, classIdentity);
-        builder.AddNode(classId, "REPOSITORY", key.ClassName, classIdentity, key.ClassName, systemKey, database, repository, "TECHNICAL");
-    }
-    else if (key.ClassName.EndsWith("Service", StringComparison.Ordinal))
-    {
-        classId = ExtractorRuntime.StableNodeId("service", repository, classIdentity);
-        builder.AddNode(classId, "SERVICE", key.ClassName, classIdentity, key.ClassName, systemKey, database, repository, "TECHNICAL");
-    }
+    var (classPrefix, classType) = key.ClassName.EndsWith("Repository", StringComparison.Ordinal)
+        ? ("repository", "REPOSITORY")
+        : key.ClassName.EndsWith("Service", StringComparison.Ordinal)
+            ? ("service", "SERVICE")
+            : ("csharp-type", "CSHARP_TYPE");
+    var classId = ExtractorRuntime.StableNodeId(classPrefix, repository, classIdentity);
+    builder.AddNode(classId, classType, key.ClassName, classIdentity, key.ClassName, systemKey, database, repository, "TECHNICAL");
     var declarationKey = method is null ? $"{classIdentity}.{key.MemberName}" : $"{method.File.RelativePath}:{method.Start}:{key.ClassName}.{key.MemberName}";
-    var methodId = ExtractorRuntime.StableNodeId(classId is null ? "local-routine" : "method", repository, declarationKey);
-    builder.AddNode(methodId, classId is null ? "LOCAL_ROUTINE" : "METHOD", key.MemberName, $"{repository}.{declarationKey}", key.MemberName, systemKey, database, repository, "TECHNICAL");
-    if (classId is not null) builder.AddEdge(classId, methodId, "CONTAINS", "STRUCTURAL");
+    var methodId = ExtractorRuntime.StableNodeId("method", repository, declarationKey);
+    builder.AddNode(methodId, "METHOD", key.MemberName, $"{repository}.{declarationKey}", key.MemberName, systemKey, database, repository, "TECHNICAL");
+    builder.AddEdge(classId, methodId, "CONTAINS", "STRUCTURAL");
     if (method is not null)
     {
         var line = ExtractorRuntime.LineForOffset(method.File, method.Start);
@@ -616,23 +667,14 @@ static List<ExecutableInfo> ResolveCanonicalExecutable(string canonical, Diction
 static List<ExecutableInfo> Lookup(Dictionary<string, List<ExecutableInfo>> index, string key)
     => index.TryGetValue(key, out var values) ? values : new List<ExecutableInfo>();
 
-static string ProjectProperty(string text, string name)
-{
-    var match = Regex.Match(text, $@"<\s*{Regex.Escape(name)}\s*>\s*(?<value>[^<]+?)\s*<\s*/\s*{Regex.Escape(name)}\s*>", RegexOptions.IgnoreCase);
-    return match.Success ? match.Groups["value"].Value.Trim() : string.Empty;
-}
-
 static List<string> ProjectReferenceIds(string text, string directory, string root, string repository)
 {
-    var result = new List<string>();
-    foreach (Match match in Regex.Matches(text, @"<\s*ProjectReference\b[^>]*\bInclude\s*=\s*""(?<path>[^""]+)""", RegexOptions.IgnoreCase))
-    {
-        var absolute = Path.GetFullPath(Path.Combine(directory, ExtractorRuntime.NativePath(match.Groups["path"].Value)));
-        if (!ExtractorRuntime.IsWithin(absolute, root)) continue;
-        var relative = ExtractorRuntime.RepositoryPath(Path.GetRelativePath(root, absolute));
-        result.Add(ExtractorRuntime.StableNodeId("dotnet-project", repository, relative));
-    }
-    return result;
+    return MsBuildProjectXml.Includes(text, "ProjectReference")
+        .Select(include => Path.GetFullPath(Path.Combine(directory, ExtractorRuntime.NativePath(include))))
+        .Where(path => ExtractorRuntime.IsWithin(path, root))
+        .Select(path => ExtractorRuntime.RepositoryPath(Path.GetRelativePath(root, path)))
+        .Select(path => ExtractorRuntime.StableNodeId("dotnet-project", repository, path))
+        .ToList();
 }
 
 static bool HasMainOrTopLevelStatements(SourceFile file)
@@ -916,24 +958,6 @@ static List<ExecutableMapping> LoadExecutableMappings(string path)
         row.GetValueOrDefault("alias", string.Empty))).ToList();
 }
 
-static bool IsStoredProcedureLiteral(string fileText, string literal)
-{
-    if (!Regex.IsMatch(literal, @"^[A-Za-z_][\w$#]*(?:\.[A-Za-z_][\w$#]*)+$")) return false;
-    var index = fileText.IndexOf(literal, StringComparison.Ordinal);
-    var window = index >= 0 ? fileText.Substring(index, Math.Min(260, fileText.Length - index)) : string.Empty;
-    return window.Contains("StoredProcedure", StringComparison.OrdinalIgnoreCase) || literal.StartsWith("PKG_", StringComparison.OrdinalIgnoreCase);
-}
-
-static bool LooksLikeSql(string text)
-{
-    return Regex.IsMatch(text, @"\b(SELECT|INSERT|UPDATE|DELETE|MERGE|EXECUTE\s+IMMEDIATE)\b", RegexOptions.IgnoreCase);
-}
-
-static bool HasDynamicSqlTarget(string text)
-{
-    return Regex.IsMatch(text, @"\b(?:FROM|JOIN|INTO|UPDATE|MERGE\s+INTO)\s+(?:[A-Za-z_][\w$#]*\s*\.\s*)?\{", RegexOptions.IgnoreCase);
-}
-
 static string Capitalize(string value)
     => string.IsNullOrWhiteSpace(value) ? value : char.ToUpperInvariant(value[0]) + value[1..];
 
@@ -945,9 +969,9 @@ sealed record ProjectInfo(string Id, string RelativePath, string Directory, stri
 sealed record ExecutableMapping(string JobSystem, string ExecutableName, string ExecutableScope, string CanonicalExecutableName, string Alias);
 
 abstract record DataFinding(MethodKey Owner, SourceFile File, int Line, string Database);
-sealed record DataEdgeFinding(MethodKey Owner, string TargetNodeId, string EdgeType, string RawOperation, SourceFile File, int Line, string EvidenceKind, string Snippet, string Database) : DataFinding(Owner, File, Line, Database);
+sealed record DataEdgeFinding(MethodKey Owner, string TargetNodeId, string EdgeType, string RawOperation, SourceFile File, int Line, string EvidenceKind, string Snippet, string Database, string RawReference = "") : DataFinding(Owner, File, Line, Database);
 sealed record ProcedureFinding(MethodKey Owner, string RawReference, string RawOperation, SourceFile File, int Line, string EvidenceKind, string Snippet, string Database) : DataFinding(Owner, File, Line, Database);
-sealed record SequenceFinding(MethodKey Owner, string SequenceName, SourceFile File, int Line, string Database) : DataFinding(Owner, File, Line, Database);
+sealed record SequenceFinding(MethodKey Owner, string SequenceName, string Operation, SourceFile File, int Line, string Database) : DataFinding(Owner, File, Line, Database);
 sealed record IssueFinding(MethodKey Owner, string IssueType, string Severity, string Message, string RawReference, SourceFile File, int Line, string Database, Dictionary<string, object>? Properties = null) : DataFinding(Owner, File, Line, Database);
 
 sealed class ExecutableInfo

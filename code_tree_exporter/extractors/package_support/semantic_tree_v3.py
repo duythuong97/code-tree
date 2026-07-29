@@ -5,9 +5,22 @@ from code_tree_exporter.extractors.package_support.package_writer import line_fo
 from code_tree_exporter.extractors.package_support.sql_analyzer import analyze_sql
 
 
-def plsql_steps(builder, owner_id: str, text: str, source_path: str, base_line: int) -> list[dict]:
+def plsql_steps(
+    builder,
+    owner_id: str,
+    text: str,
+    source_path: str,
+    base_line: int,
+    *,
+    detail: str = "summary",
+) -> list[dict]:
     """Project ANTLR syntax into nested behavior facts; deliberately not a CFG."""
-    return _PlsqlProjector(builder, owner_id, text, source_path, base_line).steps()
+    steps = _PlsqlProjector(builder, owner_id, text, source_path, base_line).steps()
+    if detail == "full":
+        return steps
+    if detail == "summary":
+        return _summarize_steps(steps)
+    raise ValueError("PL/SQL semantic detail must be 'summary' or 'full'")
 
 
 def sql_facts(builder, owner_id: str, text: str, source_path: str, base_line: int) -> list[dict]:
@@ -51,10 +64,10 @@ class _PlsqlProjector:
     def __init__(self, builder, owner_id: str, text: str, source_path: str, base_line: int) -> None:
         self.builder = builder
         self.owner_id = owner_id
-        self.text = text
+        self.text = _standalone_routine_text(text)
         self.source_path = source_path
         self.base_line = base_line
-        self.parser = OraclePlsqlParser(text)
+        self.parser = OraclePlsqlParser(self.text)
         self.antlr = self.parser._antlr_parser
         self.calls = self.parser.calls()
 
@@ -198,6 +211,85 @@ def _edge_target(builder, owner_id: str, object_name: str, edge_types: set[str])
             candidates.append(edge["target_node_id"])
     unique = set(candidates)
     return next(iter(unique)) if len(unique) == 1 else None
+
+
+_SUMMARY_LEAF_TYPES = frozenset({"call", "data_effect", "raise"})
+_SUMMARY_CONTAINER_TYPES = frozenset(
+    {"block", "branch", "case", "catch", "loop", "sql", "try"}
+)
+_SUMMARY_CHILD_KEYS = (
+    "steps",
+    "else_steps",
+    "catches",
+    "finally_steps",
+    "cases",
+    "effects",
+)
+
+
+def _summarize_steps(steps: list[dict]) -> list[dict]:
+    facts: list[dict] = []
+    for fact in steps:
+        facts.extend(_summarize_fact(fact))
+    return facts
+
+
+def _summarize_fact(fact: dict) -> list[dict]:
+    kind = str(fact.get("type") or "")
+    children = {
+        key: _summarize_steps(value)
+        for key in _SUMMARY_CHILD_KEYS
+        if isinstance((value := fact.get(key)), list) and value
+    }
+    if kind in _SUMMARY_LEAF_TYPES:
+        return [_summary_leaf(fact)]
+    if kind == "sql" and children.get("effects"):
+        return children["effects"]
+    if kind not in _SUMMARY_CONTAINER_TYPES:
+        return [child for values in children.values() for child in values]
+    if not children:
+        if kind != "sql":
+            return []
+        action = str(fact.get("action") or "SQL")
+        return [
+            {
+                "type": "sql",
+                "label": f"{action} statement",
+                "source": fact["source"],
+                "action": action,
+            }
+        ]
+
+    result = {
+        "type": kind,
+        "label": fact.get("label", ""),
+        "source": fact["source"],
+    }
+    for key in ("condition", "iterator", "action"):
+        if fact.get(key) not in (None, ""):
+            result[key] = fact[key]
+    result.update(children)
+    return [result]
+
+
+def _summary_leaf(fact: dict) -> dict:
+    result = {
+        "type": fact["type"],
+        "label": fact.get("label", ""),
+        "source": fact["source"],
+    }
+    for key in ("action", "resolution", "ref_node_id"):
+        if fact.get(key) not in (None, ""):
+            result[key] = fact[key]
+    return result
+
+
+def _standalone_routine_text(text: str) -> str:
+    leading = len(text) - len(text.lstrip())
+    keyword = text[leading:].split(None, 1)[0].upper() if text[leading:].strip() else ""
+    if keyword in {"PROCEDURE", "FUNCTION"}:
+        return f"{text[:leading]}CREATE OR REPLACE {text[leading:]}"
+    return text
 
 
 def _call_arguments(raw: str) -> list[str]:

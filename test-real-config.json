@@ -1,0 +1,12 @@
+{
+  "root": "/Volumes/thuong.pham/sources/code-tree-exporter/demo-sources-real",
+  "output": "/Volumes/thuong.pham/sources/code-tree-exporter/output-real",
+  "outputMode": "partitioned",
+  "sources": [
+    {
+      "name": "nopCommerce",
+      "type": "dotnet-api",
+      "folders": ["nopCommerce"]
+    }
+  ]
+}

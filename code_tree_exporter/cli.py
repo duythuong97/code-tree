@@ -10,7 +10,10 @@ from .pipeline import run_pipeline
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Extract configured source units into one graph package and two Markdown trees."
+        description=(
+            "Extract configured source units into graph packages, codebase memory, "
+            "and RAG knowledge."
+        )
     )
     parser.add_argument(
         "--config", required=True, help="Path to the unified JSON config."

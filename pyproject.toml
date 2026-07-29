@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "code-tree-exporter"
-version = "0.2.0"
-description = "Extract configured source code into a canonical graph, file tree, and system tree"
+version = "0.4.0"
+description = "Extract source code into a queryable graph, codebase memory, and RAG knowledge"
 requires-python = ">=3.10"
 dependencies = ["antlr4-python3-runtime==4.13.2"]
 
 [project.scripts]
 code-tree-exporter = "code_tree_exporter.cli:main"
+code-tree-query = "code_tree_exporter.query:main"
 
 [tool.setuptools.packages.find]
 include = ["code_tree_exporter*"]
@@ -25,10 +26,10 @@ code_tree_exporter = [
   "extractors/angular-extractor/main.py",
   "extractors/angular-extractor/package.json",
   "extractors/dotnet-api-extractor/main.py",
-  "extractors/dotnet-api-extractor/Program.cs",
+  "extractors/dotnet-api-extractor/*.cs",
   "extractors/dotnet-api-extractor/*.csproj",
   "extractors/dotnet-batch-extractor/main.py",
-  "extractors/dotnet-batch-extractor/Program.cs",
+  "extractors/dotnet-batch-extractor/*.cs",
   "extractors/dotnet-batch-extractor/*.csproj",
   "extractors/plsql-extractor/main.py",
   "extractors/sql-file-extractor/main.py",

@@ -62,11 +62,27 @@ function extract(ts, config) {
   const systemKey = config.system || source;
   const discovery = discoverAngularProject(config);
   const files = configuredFiles(config, ['.ts', '.html'], discovery);
+
+  // Create TypeScript Program
+  const tsconfigPath = discovery.tsconfigPath;
+  let program;
+  let typeChecker;
+  if (tsconfigPath && existsSync(tsconfigPath)) {
+    const configFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
+    const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.dirname(tsconfigPath));
+    program = ts.createProgram(parsedConfig.fileNames, parsedConfig.options);
+    typeChecker = program.getTypeChecker();
+  } else {
+    // Fallback if no tsconfig
+    program = ts.createProgram(files.filter(f => f.absolute.endsWith('.ts')).map(f => f.absolute), {});
+    typeChecker = program.getTypeChecker();
+  }
+
   const builder = new PackageBuilder(`angular-${source}`, `extractor:angular/${source}`, 'angular-extractor', VERSION, {
     source,
     repository,
     technology: 'Node.js TypeScript Compiler API',
-    parser: 'typescript.createSourceFile',
+    parser: 'typescript.createProgram',
     angularJson: discovery.angularJsonPath ? repoPath(path.relative(discovery.root, discovery.angularJsonPath)) : '',
     angularProject: discovery.angularProjectName,
     tsconfig: discovery.tsconfigPath ? repoPath(path.relative(discovery.root, discovery.tsconfigPath)) : '',
@@ -77,7 +93,11 @@ function extract(ts, config) {
 
   const appConfig = loadAppConfig(config);
   for (const file of files) {
-    Object.assign(appConfig, inlineConfig(ts, file.sourceFile));
+    if (file.absolute.endsWith('.ts')) {
+      // Use program's source file if available, otherwise fallback to parsed
+      file.sourceFile = program.getSourceFile(file.absolute) || file.sourceFile;
+      Object.assign(appConfig, inlineConfig(ts, file.sourceFile));
+    }
   }
   const projectId = stableNodeId('angular-project', repository, source);
   builder.addNode(projectId, 'ANGULAR_PROJECT', source, source, source, { system_key: systemKey, repository_key: repository, graph_role: 'TECHNICAL' });
@@ -131,7 +151,7 @@ function extract(ts, config) {
       if (!ts.isClassDeclaration(node) || !node.name) return;
       const className = node.name.text;
       const classText = node.getText(file.sourceFile);
-      if (!/\bHttpClient\b|\bthis\.http\b/.test(classText)) return;
+      if (!/\bHttpClient\b|\bHttp\b|\bthis\.http\b/.test(classText)) return;
       const serviceId = stableNodeId('angular-service', source, slug(className.replace(/Service$/, '')));
       serviceIds.set(className, serviceId);
       builder.addNode(serviceId, 'ANGULAR_SERVICE', className, `${source}.${className}`, className, {
@@ -192,7 +212,7 @@ function extract(ts, config) {
       const className = node.name.text;
       const screenId = classToScreen.get(className);
       if (!screenId) return;
-      const serviceReceivers = componentServiceReceivers(ts, node, serviceIds);
+      const serviceReceivers = componentServiceReceivers(ts, node, serviceIds, typeChecker);
       for (const member of node.members) {
         const callable = callableMember(ts, member);
         if (!callable) continue;
@@ -207,10 +227,15 @@ function extract(ts, config) {
         const edgeId = builder.addEdge(screenId, actionId, 'CONTAINS', { graph_layer: 'STRUCTURAL' });
         for (const event of templateEventsForMethod) {
           builder.addEvidence('EDGE', edgeId, event.sourcePath, event.line, event.line, 'TEMPLATE_EVENT', event.snippet);
+
+          // Extract template metadata (routerLink, click, etc)
+          if (event.metadata) {
+             builder.setNodeProperty(actionId, 'template_metadata', event.metadata);
+          }
         }
         const callRefs = new Map();
         visit(callable.body, call => {
-          const serviceMethod = serviceCall(ts, call, serviceReceivers);
+          const serviceMethod = serviceCall(ts, call, serviceReceivers, typeChecker);
           if (!serviceMethod) return;
           const scopedApiIds = serviceMethod.serviceClass ? serviceMethodToApi.get(`${serviceMethod.serviceClass}::${serviceMethod.method}`) || [] : [];
           const apiIds = scopedApiIds.length ? scopedApiIds : methodToApi.get(serviceMethod.method) || [];
@@ -536,11 +561,17 @@ function nearestAngularJson(root, folders) {
   for (const candidate of candidates) {
     let current = existsSync(candidate) && statSync(candidate).isFile() ? path.dirname(candidate) : candidate;
     while (current === root || current.startsWith(root + path.sep)) {
-      const angularJson = path.join(current, 'angular.json');
-      if (existsSync(angularJson)) return angularJson;
+      for (const name of ['angular.json', '.angular-cli.json', 'angular-cli.json']) {
+        const angularJson = path.join(current, name);
+        if (existsSync(angularJson)) return angularJson;
+      }
       if (current === root) break;
       current = path.dirname(current);
     }
+  }
+  for (const name of ['angular.json', '.angular-cli.json', 'angular-cli.json']) {
+    const angularJson = path.join(root, name);
+    if (existsSync(angularJson)) return angularJson;
   }
   return path.join(root, 'angular.json');
 }
@@ -885,20 +916,20 @@ function configAccessKey(ts, expression, context = null) {
   return '';
 }
 
-function componentServiceReceivers(ts, classNode, serviceIds) {
+function componentServiceReceivers(ts, classNode, serviceIds, typeChecker) {
   const receivers = new Map();
   const serviceClasses = [...serviceIds.keys()];
   for (const member of classNode.members) {
     if (ts.isConstructorDeclaration(member)) {
       for (const parameter of member.parameters) {
         if (!ts.isIdentifier(parameter.name)) continue;
-        const serviceClass = parameterServiceClass(parameter, serviceIds, serviceClasses);
+        const serviceClass = parameterServiceClass(parameter, serviceIds, serviceClasses, typeChecker);
         if (!serviceClass) continue;
         receivers.set(`this.${parameter.name.text}`, serviceClass);
       }
     }
     if (ts.isPropertyDeclaration(member) && member.name && ts.isIdentifier(member.name)) {
-      const serviceClass = typedServiceClass(member.type, serviceIds) || inferredServiceClass(member.name.text, serviceClasses);
+      const serviceClass = typedServiceClass(member.type, serviceIds, typeChecker, member) || inferredServiceClass(member.name.text, serviceClasses);
       if (serviceClass) receivers.set(`this.${member.name.text}`, serviceClass);
     }
   }
@@ -906,11 +937,25 @@ function componentServiceReceivers(ts, classNode, serviceIds) {
   return receivers;
 }
 
-function parameterServiceClass(parameter, serviceIds, serviceClasses) {
-  return typedServiceClass(parameter.type, serviceIds) || inferredServiceClass(parameter.name.text, serviceClasses);
+function parameterServiceClass(parameter, serviceIds, serviceClasses, typeChecker) {
+  return typedServiceClass(parameter.type, serviceIds, typeChecker, parameter) || inferredServiceClass(parameter.name.text, serviceClasses);
 }
 
-function typedServiceClass(typeNode, serviceIds) {
+function typedServiceClass(typeNode, serviceIds, typeChecker, node) {
+  if (!typeNode && !typeChecker) return '';
+
+  if (typeChecker && node) {
+      try {
+          const type = typeChecker.getTypeAtLocation(node);
+          if (type && type.symbol) {
+              const name = type.symbol.name;
+              if (serviceIds.has(name)) return name;
+          }
+      } catch (e) {
+          // Fallback to AST
+      }
+  }
+
   if (!typeNode) return '';
   const text = typeNode.getText(typeNode.getSourceFile()).replace(/<.*>$/g, '').trim();
   return serviceIds.has(text) ? text : '';
@@ -921,9 +966,24 @@ function inferredServiceClass(name, serviceClasses) {
   return /service$/i.test(name) || name === 'service' ? serviceClasses[0] : '';
 }
 
-function serviceCall(ts, node, serviceReceivers = new Map()) {
+function serviceCall(ts, node, serviceReceivers = new Map(), typeChecker) {
   if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression)) return '';
   const receiver = node.expression.expression.getText(node.getSourceFile());
+
+  if (typeChecker) {
+      try {
+          const type = typeChecker.getTypeAtLocation(node.expression.expression);
+          if (type && type.symbol) {
+              const serviceClass = type.symbol.name;
+              if (serviceReceivers.has(receiver) || serviceClass.endsWith('Service')) {
+                  return { method: node.expression.name.text, serviceClass: serviceClass };
+              }
+          }
+      } catch (e) {
+          // Fallback to AST
+      }
+  }
+
   if (serviceReceivers.has(receiver)) return { method: node.expression.name.text, serviceClass: serviceReceivers.get(receiver) };
   if (receiver === 'this.service' || receiver.endsWith('._service')) return { method: node.expression.name.text, serviceClass: '' };
   return '';
@@ -1026,7 +1086,33 @@ function templateEvents(text, sourcePath = '', lineOffset = 0) {
   for (const match of text.matchAll(regex)) {
     const method = eventMethodName(match[2]);
     if (!method) continue;
-    events.push({ method, snippet: match[0], line: lineOffset + text.slice(0, match.index).split(/\r?\n/).length, sourcePath });
+
+    // Extract surrounding element context for metadata
+    const beforeMatch = text.slice(0, match.index);
+    const elementStart = beforeMatch.lastIndexOf('<');
+    let metadata = {};
+    if (elementStart >= 0) {
+        const elementTagMatch = beforeMatch.slice(elementStart).match(/^<([a-zA-Z0-9-]+)/);
+        if (elementTagMatch) {
+            metadata.element = elementTagMatch[1];
+        }
+
+        // Look for routerLink in the same element
+        const elementEnd = text.indexOf('>', match.index);
+        if (elementEnd >= 0) {
+            const elementContent = text.slice(elementStart, elementEnd);
+            const routerLinkMatch = elementContent.match(/routerLink\s*=\s*['"]([^'"]+)['"]/);
+            if (routerLinkMatch) {
+                metadata.routerLink = routerLinkMatch[1];
+            }
+            const routerLinkBindingMatch = elementContent.match(/\[routerLink\]\s*=\s*['"]([^'"]+)['"]/);
+            if (routerLinkBindingMatch) {
+                metadata.routerLinkBinding = routerLinkBindingMatch[1];
+            }
+        }
+    }
+
+    events.push({ method, snippet: match[0], line: lineOffset + text.slice(0, match.index).split(/\r?\n/).length, sourcePath, metadata: Object.keys(metadata).length > 0 ? metadata : undefined });
   }
   return events;
 }

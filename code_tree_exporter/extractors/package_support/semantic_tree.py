@@ -18,6 +18,7 @@ def attach_plsql_semantic_tree(
     text: str = "",
     source_path: str = "",
     base_line: int = 1,
+    detail: str = "summary",
 ) -> None:
     tree = {
         "version": 3,
@@ -25,7 +26,14 @@ def attach_plsql_semantic_tree(
         "label": name,
         "summary": "",
         "parameters": _parameters(parameter_block, signature),
-        "steps": plsql_steps(builder, owner_id, text, source_path, base_line),
+        "steps": plsql_steps(
+            builder,
+            owner_id,
+            text,
+            source_path,
+            base_line,
+            detail=detail,
+        ),
         "analysis_notes": _analysis_notes_v3(builder, owner_id, source_path, base_line),
     }
     _set_tree(builder, owner_id, tree)

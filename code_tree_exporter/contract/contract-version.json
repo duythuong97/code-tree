@@ -1,6 +1,6 @@
 {
-  "contract": "code-map-csv",
-  "version": "1.0",
-  "compatibility": "requirements-native",
-  "identity_version": 1
+  "contract": "code-map-sqlite",
+  "version": "2.0",
+  "compatibility": "sqlite-primary-with-stable-id-lookup",
+  "identity_version": 2
 }

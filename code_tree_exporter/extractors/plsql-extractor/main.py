@@ -11,15 +11,12 @@ PACKAGE_IMPORT_ROOT = Path(__file__).resolve().parents[3]
 if str(PACKAGE_IMPORT_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_IMPORT_ROOT))
 
-from code_tree_exporter.contract.entities import ExtractionContext
 from code_tree_exporter.contract.graph_contract import (
-    column_id,
     database_id,
     normalize_http_route,
     stable_node_id,
     table_id,
 )
-from code_tree_exporter.extractors.oracle_plsql.lineage import OraclePlSqlLineageExtractor
 from code_tree_exporter.extractors.package_support.package_writer import (
     Catalog,
     PackageBuilder,
@@ -43,25 +40,16 @@ from code_tree_exporter.extractors.package_support.oracle_parser import (
     OraclePlsqlParser,
     ParsedCallReference,
     ParsedRoutineDeclaration,
-    mask_noncode,
 )
 from code_tree_exporter.extractors.package_support.semantic_tree import (
     attach_plsql_semantic_tree as _attach_semantic_tree,
 )
-from code_tree_exporter.extractors.package_support.sql_analyzer import analyze_sql, routine_signature
+from code_tree_exporter.extractors.package_support.sql_analyzer import analyze_sql
 
 _VERSION = "1.0.0"
-_IDENT = r'(?:"[^"]+"|[A-Za-z_][\w$#]*)'
-_OBJECT = rf"{_IDENT}(?:\s*\.\s*{_IDENT}){{0,2}}(?:\s*@\s*[A-Za-z_][\w$#]*)?"
-_VIEW_DECL_RE = re.compile(
-    rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:EDITIONABLE\s+)?(?P<mview>MATERIALIZED\s+)?VIEW\s+(?P<name>{_OBJECT})\b.*?\bAS\b",
-    re.IGNORECASE | re.DOTALL,
-)
 _EXTERNAL_API_RE = re.compile(
     r"external-api:([A-Za-z_][\w$#-]*):([A-Z]+):([^\s]+)", re.IGNORECASE
 )
-_DB_LINK_RE = re.compile(r"@([A-Za-z_][\w$#]*)")
-_EXECUTE_IMMEDIATE_RE = re.compile(r"\bEXECUTE\s+IMMEDIATE\b", re.IGNORECASE)
 _SKIP_CALLS = {
     "COUNT",
     "SUM",
@@ -116,6 +104,7 @@ def extract(config: dict) -> None:
     output = Path(config["output"]).resolve()
     catalog = Catalog.load(input_root, database)
     local_routines = {item.upper() for item in config.get("localRoutines", [])}
+    semantic_detail = _semantic_detail(config.get("semanticDetail", "summary"))
 
     files = configured_files(
         config, [".pks", ".pkb", ".pck", ".pls", ".plb", ".fnc", ".prc", ".trg", ".sql"]
@@ -129,6 +118,7 @@ def extract(config: dict) -> None:
             "source": source,
             "technology": "Python + ANTLR4 runtime Oracle PL/SQL parser",
             "parser": "extractors.package_support.oracle_parser.OraclePlsqlParser",
+            "semanticDetail": semantic_detail,
         },
     )
     builder.files_scanned = len(files)
@@ -146,26 +136,27 @@ def extract(config: dict) -> None:
 
     for file in files:
         file_database = file.database or database
-        _extract_file(
-            builder,
-            file.relative,
-            file.text,
-            file_database,
-            schema,
-            repository,
-            system_key,
-            catalog,
-            local_routines,
-        )
-        _extract_column_lineage(
-            builder,
-            file.relative,
-            file.text,
-            file_database,
-            schema,
-            repository,
-            system_key,
-        )
+        chunks = re.split(r'(?m)^\s*/\s*$', file.text)
+        base_line = 1
+        for chunk in chunks:
+            if not chunk.strip():
+                base_line += chunk.count('\n') + 1
+                continue
+            # Prepend newlines so line_for_offset returns absolute line numbers
+            padded = '\n' * (base_line - 1) + chunk
+            _extract_file(
+                builder,
+                file.relative,
+                padded,
+                file_database,
+                schema,
+                repository,
+                system_key,
+                catalog,
+                local_routines,
+                semantic_detail,
+            )
+            base_line += chunk.count('\n') + 1
 
     for node in config.get("supplementalNodes", []):
         builder.add_node(
@@ -195,220 +186,6 @@ def extract(config: dict) -> None:
     builder.write(output)
 
 
-def _extract_column_lineage(
-    builder: PackageBuilder,
-    source_path: str,
-    text: str,
-    database: str,
-    schema: str,
-    repository: str,
-    system_key: str,
-) -> None:
-    context = ExtractionContext(
-        repository=repository,
-        db_name=database,
-        schema_name=schema,
-        source_id=builder.source_id,
-        relative_source_path=source_path,
-    )
-    result = OraclePlSqlLineageExtractor().extract(source_path, text, context)
-    column_ids: dict[str, str] = {}
-    column_parts: dict[str, tuple[str, str]] = {}
-    for node in result.nodes:
-        if node.label != "Column":
-            continue
-        table_name = str(node.properties.get("table_name") or "")
-        column_name = str(node.properties.get("name") or "")
-        if not table_name or not column_name:
-            continue
-        node_id = column_id(database, table_name, column_name)
-        column_ids[node.key_value] = node_id
-        column_parts[node.key_value] = (table_name, column_name)
-        builder.add_node(
-            node_id,
-            "COLUMN",
-            column_name,
-            f"{database}.{table_name}.{column_name}",
-            column_name,
-            system_key=system_key,
-            database_key=database,
-            repository_key=repository,
-            confidence=0.9,
-            properties={
-                "table_node_id": table_id(database, table_name),
-                "table_code": table_name,
-                "column_code": column_name,
-            },
-        )
-    owner_ids: dict[str, str] = {}
-    owner_keys = {
-        edge.from_key_value
-        for edge in result.edges
-        if edge.rel_type in {"READS_COLUMN", "WRITES_COLUMN", "POPULATES"}
-    }
-    for owner_key in owner_keys:
-        name = owner_key.rsplit(".", 1)[-1].upper()
-        candidates = [
-            row["node_id"]
-            for row in builder.nodes.values()
-            if row["technical_name"].upper() == name
-            and row["node_type"]
-            in {"PROCEDURE", "FUNCTION", "TRIGGER", "PLSQL_PACKAGE", "LOCAL_ROUTINE"}
-        ]
-        if len(candidates) == 1:
-            owner_ids[owner_key] = candidates[0]
-    for edge in result.edges:
-        if edge.rel_type not in {
-            "READS_COLUMN",
-            "WRITES_COLUMN",
-            "DERIVES_FROM",
-            "POPULATES",
-        }:
-            continue
-        source_id = column_ids.get(edge.from_key_value) or owner_ids.get(
-            edge.from_key_value
-        )
-        target_id = column_ids.get(edge.to_key_value)
-        if not source_id or not target_id:
-            continue
-        properties = dict(edge.properties)
-        operation = str(properties.pop("operation", ""))
-        confidence = float(properties.pop("confidence", 0.5))
-        line = int(properties.pop("line", 0) or 0)
-        properties.pop("source_file", None)
-        edge_id = builder.add_edge(
-            source_id,
-            target_id,
-            edge.rel_type,
-            raw_operation=operation,
-            confidence=confidence,
-            properties=properties,
-        )
-        if line:
-            builder.add_evidence(
-                "EDGE",
-                edge_id,
-                source_path,
-                line,
-                line,
-                "SQL_COLUMN_LINEAGE",
-                line_text(text, line),
-                confidence=confidence,
-                properties=properties,
-            )
-    _attach_edge_semantics(
-        builder,
-        result.edges,
-        owner_ids,
-        column_ids,
-        column_parts,
-        source_path,
-        database,
-    )
-
-
-def _attach_edge_semantics(
-    builder: PackageBuilder,
-    lineage_edges: list,
-    owner_ids: dict[str, str],
-    column_ids: dict[str, str],
-    column_parts: dict[str, tuple[str, str]],
-    source_path: str,
-    database: str,
-) -> None:
-    derived: dict[tuple[str, int, str], list[str]] = {}
-    for edge in lineage_edges:
-        if edge.rel_type != "DERIVES_FROM" or edge.from_key_value not in column_ids:
-            continue
-        line = int(edge.properties.get("line", 0) or 0)
-        operation = str(edge.properties.get("operation", ""))
-        derived.setdefault((edge.to_key_value, line, operation), []).append(
-            column_ids[edge.from_key_value]
-        )
-
-    statements: dict[tuple[str, str, str, int], list[dict]] = {}
-    for edge in lineage_edges:
-        if edge.rel_type != "WRITES_COLUMN":
-            continue
-        owner_id = owner_ids.get(edge.from_key_value)
-        target = column_parts.get(edge.to_key_value)
-        if not owner_id or not target:
-            continue
-        table_name, column_name = target
-        operation = str(edge.properties.get("operation", ""))
-        line = int(edge.properties.get("line", 0) or 0)
-        field = {
-            "name": column_name,
-            "target_node_id": column_ids[edge.to_key_value],
-            "expression": str(edge.properties.get("expression", "")),
-            "sources": sorted(
-                set(derived.get((edge.to_key_value, line, operation), []))
-            ),
-        }
-        statements.setdefault((owner_id, table_name, operation, line), []).append(field)
-
-    by_table_edge: dict[tuple[str, str, str], list[dict]] = {}
-    operation_map = {
-        "INSERT": ("INSERTS", "INSERT"),
-        "UPDATE": ("UPDATES", "UPDATE"),
-        "MERGE": ("MERGES", "MERGE"),
-    }
-    for (owner_id, table_name, lineage_operation, line), fields in statements.items():
-        sql_operation = lineage_operation.split("_", 1)[0]
-        mapped = operation_map.get(sql_operation)
-        if not mapped:
-            continue
-        edge_type, raw_operation = mapped
-        statement = {
-            "operation": lineage_operation,
-            "source": {"path": source_path, "line": line},
-            "fields": sorted(fields, key=lambda item: item["name"]),
-        }
-        by_table_edge.setdefault((owner_id, table_name, edge_type), []).append(
-            statement
-        )
-        edge_id = builder.add_edge(
-            owner_id,
-            table_id(database, table_name),
-            edge_type,
-            raw_operation=raw_operation,
-        )
-        statements_for_edge = sorted(
-            by_table_edge[(owner_id, table_name, edge_type)],
-            key=lambda item: (item["source"]["line"], item["operation"]),
-        )
-        builder.merge_edge_properties(
-            edge_id,
-            {
-                "semantic": {
-                    "version": 1,
-                    "action": "WRITE",
-                    "operation": raw_operation,
-                    "target": {
-                        "node_id": table_id(database, table_name),
-                        "type": "TABLE",
-                        "name": table_name,
-                    },
-                    "fields": _unique_semantic_fields(statements_for_edge),
-                    "statements": statements_for_edge,
-                }
-            },
-        )
-
-
-def _unique_semantic_fields(statements: list[dict]) -> list[dict]:
-    fields: dict[tuple[str, str, tuple[str, ...]], dict] = {}
-    for statement in statements:
-        for field in statement["fields"]:
-            key = (
-                field["target_node_id"],
-                field["expression"],
-                tuple(field["sources"]),
-            )
-            fields.setdefault(key, field)
-    return sorted(fields.values(), key=lambda item: (item["name"], item["expression"]))
-
-
 def _extract_file(
     builder: PackageBuilder,
     source_path: str,
@@ -419,14 +196,21 @@ def _extract_file(
     system_key: str,
     catalog: Catalog,
     local_routines: set[str],
+    semantic_detail: str,
 ) -> None:
     parser = OraclePlsqlParser(text)
+    full_analysis = analyze_sql(text)
     if parser.syntax_errors:
         details = "; ".join(
             f"line {line}:{column} {message}"
             for line, column, message in parser.syntax_errors[:5]
         )
-        raise ValueError(f"ANTLR PL/SQL parse failed for {source_path}: {details}")
+        builder.add_issue(
+            "PARSE_ERROR",
+            "ERROR",
+            f"ANTLR PL/SQL parse failed for {source_path}: {details}",
+            source_path=source_path,
+        )
     package = parser.package_name() or "STANDALONE"
     package_node = plsql_package_id(database, package)
     if package != "STANDALONE":
@@ -509,6 +293,7 @@ def _extract_file(
 
     view_ranges = _extract_view_declarations(
         builder,
+        parser,
         source_path,
         text,
         database,
@@ -518,6 +303,7 @@ def _extract_file(
         catalog,
         routine_by_name,
         synonyms,
+        full_analysis,
     )
 
     parsed_triggers = parser.triggers()
@@ -567,6 +353,7 @@ def _extract_file(
             catalog,
             routine_by_name,
             synonyms,
+            full_analysis,
             _calls_in_range(all_calls, parsed_trigger.start, parsed_trigger.end),
         )
         _attach_semantic_tree(
@@ -578,6 +365,7 @@ def _extract_file(
             text=trigger_segment,
             source_path=source_path,
             base_line=start_line,
+            detail=semantic_detail,
         )
 
     for routine in routines:
@@ -596,6 +384,7 @@ def _extract_file(
             catalog,
             routine_by_name,
             synonyms,
+            full_analysis,
             _calls_in_routine(all_calls, routine, routines),
         )
         _attach_semantic_tree(
@@ -608,6 +397,7 @@ def _extract_file(
             text=segment,
             source_path=source_path,
             base_line=line_for_offset(text, routine.start),
+            detail=semantic_detail,
         )
 
     if package != "STANDALONE":
@@ -631,8 +421,16 @@ def _extract_file(
             catalog,
             routine_by_name,
             synonyms,
+            full_analysis,
             _calls_outside_ranges(all_calls, excluded_ranges),
         )
+
+
+def _semantic_detail(value) -> str:
+    detail = str(value or "summary").strip().lower()
+    if detail not in {"summary", "full"}:
+        raise ValueError("semanticDetail must be 'summary' or 'full'")
+    return detail
 
 
 def _routines_from_parser(
@@ -645,7 +443,7 @@ def _routines_from_parser(
     node_by_item: dict[ParsedRoutineDeclaration, str] = {}
     for item in parsed:
         parent = parent_by_item[item]
-        signature = routine_signature(item.parameter_block)
+        signature = parser.routine_signature(item)
         if parent:
             node_by_item[item] = stable_node_id(
                 "local-routine", database, package, parent.name, item.name, signature
@@ -655,7 +453,7 @@ def _routines_from_parser(
         else:
             node_by_item[item] = function_id(database, package, item.name, signature)
     for item in parsed:
-        signature = routine_signature(item.parameter_block)
+        signature = parser.routine_signature(item)
         parent = parent_by_item[item]
         is_local = item.name in local_routines or parent is not None
         node = node_by_item[item]
@@ -748,6 +546,7 @@ def _calls_outside_ranges(
 
 def _extract_view_declarations(
     builder: PackageBuilder,
+    parser: OraclePlsqlParser,
     source_path: str,
     text: str,
     database: str,
@@ -757,21 +556,19 @@ def _extract_view_declarations(
     catalog: Catalog,
     routine_by_name: dict[str, list[Routine]],
     synonyms: dict[str, SynonymTarget],
+    full_analysis,
 ) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
-    scan = mask_noncode(text)
-    for match in _VIEW_DECL_RE.finditer(scan):
-        raw_name = _normalize_object_name(match.group("name"))
-        name = leaf_identifier(raw_name)
-        node_type = "MATERIALIZED_VIEW" if match.group("mview") else "VIEW"
+    for declaration in parser.views():
+        name = leaf_identifier(declaration.name)
         node = stable_node_id(
-            "materialized-view" if node_type == "MATERIALIZED_VIEW" else "view",
+            "materialized-view" if declaration.kind == "MATERIALIZED_VIEW" else "view",
             database,
             name,
         )
         builder.add_node(
             node,
-            node_type,
+            declaration.kind,
             name,
             f"{database}.{name}",
             name,
@@ -779,25 +576,24 @@ def _extract_view_declarations(
             database_key=database,
             repository_key=repository,
         )
-        end = _ddl_end(scan, match.end())
-        start_line = line_for_offset(text, match.start())
+        start_line = line_for_offset(text, declaration.start)
         builder.add_evidence(
             "NODE",
             node,
             source_path,
             start_line,
-            line_for_offset(text, end),
+            line_for_offset(text, declaration.end),
             "DECLARATION",
             line_text(text, start_line),
         )
-        ranges.append((match.start(), end))
+        ranges.append((declaration.start, declaration.end))
         _extract_dependencies(
             builder,
             node,
             source_path,
-            text[match.end() : end],
+            text[declaration.body_start : declaration.end],
             text,
-            match.end(),
+            declaration.body_start,
             database,
             schema,
             repository,
@@ -805,30 +601,13 @@ def _extract_view_declarations(
             catalog,
             routine_by_name,
             synonyms,
+            full_analysis,
         )
     return ranges
 
 
-def _ddl_end(scan: str, start: int) -> int:
-    slash = re.search(r"^\s*/\s*$", scan[start:], re.MULTILINE)
-    next_create = re.search(
-        r"\bCREATE\s+(?:OR\s+REPLACE\s+)?", scan[start:], re.IGNORECASE
-    )
-    candidates = [start + match.start() for match in (slash, next_create) if match]
-    return min(candidates) if candidates else len(scan)
 
 
-def _normalize_object_name(name: str) -> str:
-    parts = []
-    for raw in re.split(r"\s*\.\s*", name.strip()):
-        part = raw.strip().strip('"')
-        if part:
-            parts.append(
-                part.upper()
-                if not (raw.strip().startswith('"') and raw.strip().endswith('"'))
-                else part
-            )
-    return ".".join(parts)
 
 
 def _synonyms_from_parser(
@@ -895,11 +674,13 @@ def _extract_dependencies(
     catalog: Catalog,
     routine_by_name: dict[str, list[Routine]],
     synonyms: dict[str, SynonymTarget],
+    analysis,
     calls: list[ParsedCallReference] | None = None,
 ) -> None:
-    analysis = analyze_sql(text)
     for ref in analysis.tables:
-        absolute_line = line_for_offset(full_text, base_offset + ref.start)
+        if not _reference_visible(text, full_text, base_offset, ref.start):
+            continue
+        absolute_line = line_for_offset(full_text, ref.start)
         snippet = line_text(full_text, absolute_line)
         _add_table_reference(
             builder,
@@ -911,6 +692,7 @@ def _extract_dependencies(
             ref.operation,
             ref.edge_type,
             ref.remote,
+            ref.db_link,
             database,
             schema,
             repository,
@@ -920,6 +702,8 @@ def _extract_dependencies(
         )
 
     for seq in analysis.sequences:
+        if not _reference_visible(text, full_text, base_offset, seq.start):
+            continue
         name = leaf_identifier(seq.object_name)
         seq_node = sequence_id(database, name)
         builder.add_node(
@@ -933,7 +717,19 @@ def _extract_dependencies(
             repository_key=repository,
             graph_role="TECHNICAL",
         )
-        builder.add_edge(owner_id, seq_node, "USES", raw_operation="NEXTVAL")
+        edge_id = builder.add_edge(
+            owner_id, seq_node, "USES_SEQUENCE", raw_operation=seq.operation
+        )
+        line = line_for_offset(full_text, seq.start)
+        builder.add_evidence(
+            "EDGE",
+            edge_id,
+            source_path,
+            line,
+            line,
+            "SQL",
+            line_text(full_text, line),
+        )
 
     for call in calls or []:
         raw = call.object_name.upper()
@@ -1015,25 +811,10 @@ def _extract_dependencies(
             owner_id, api_node, "CALLS_API", raw_operation=method, confidence=0.8
         )
 
-    unresolved_dynamic = set(analysis.dynamic_offsets)
-    scan = mask_noncode(text)
-    for match in _EXECUTE_IMMEDIATE_RE.finditer(scan):
-        if match.start() in unresolved_dynamic:
-            continue
-        line = line_for_offset(full_text, base_offset + match.start())
-        builder.add_issue(
-            "DYNAMIC_SQL",
-            "INFO",
-            "Dynamic SQL was analyzed with best-effort literal resolution",
-            source_node_id=owner_id,
-            raw_reference="EXECUTE IMMEDIATE",
-            database_key=database,
-            source_path=source_path,
-            start_line=line,
-        )
-
     for offset in analysis.dynamic_offsets:
-        line = line_for_offset(full_text, base_offset + offset)
+        if not _reference_visible(text, full_text, base_offset, offset):
+            continue
+        line = line_for_offset(full_text, offset)
         dynamic_node = unresolved_id(database, "DYNAMIC_SQL")
         builder.add_node(
             dynamic_node,
@@ -1065,6 +846,17 @@ def _extract_dependencies(
         )
 
 
+def _reference_visible(
+    segment: str, full_text: str, base_offset: int, absolute_offset: int
+) -> bool:
+    relative = absolute_offset - base_offset
+    if relative < 0 or relative >= len(segment):
+        return False
+    original = full_text[absolute_offset : absolute_offset + 1]
+    visible = segment[relative : relative + 1]
+    return not (original and not original.isspace() and visible.isspace())
+
+
 def _add_table_reference(
     builder: PackageBuilder,
     owner_id: str,
@@ -1075,6 +867,7 @@ def _add_table_reference(
     operation: str,
     edge_type: str,
     remote: bool,
+    db_link: str,
     database: str,
     schema: str,
     repository: str,
@@ -1086,7 +879,7 @@ def _add_table_reference(
     object_name = synonym.target_name if synonym else raw_object_name
     if synonym:
         builder.add_edge(owner_id, synonym.node_id, "USES", raw_operation="SYNONYM")
-    if remote or _is_remote_reference(object_name):
+    if remote or db_link:
         _add_external_reference(
             builder,
             owner_id,
@@ -1095,7 +888,8 @@ def _add_table_reference(
             snippet,
             object_name,
             operation,
-            "REMOTE_READS" if edge_type == "READS" else edge_type,
+            "READS_FROM" if edge_type == "READS_FROM" else edge_type,
+            db_link,
             database,
             repository,
             system_key,
@@ -1118,6 +912,44 @@ def _add_table_reference(
         return
     table_name = leaf_identifier(object_name)
     if not catalog.has_table(database, table_name):
+        owner = owner_identifier(object_name, schema or "UNRESOLVED")
+        target = unresolved_id(database, f"TABLE:{owner}:{table_name}")
+        builder.add_node(
+            target,
+            "UNRESOLVED_REFERENCE",
+            table_name,
+            f"{database}.{owner}.{table_name}",
+            table_name,
+            system_key=system_key,
+            database_key=database,
+            repository_key=repository,
+            graph_role="TECHNICAL",
+            confidence=0.2,
+            properties={
+                "database": database,
+                "schema": owner,
+                "table": table_name,
+                "raw_reference": raw_object_name,
+            },
+        )
+        edge_id = builder.add_edge(
+            owner_id,
+            target,
+            edge_type,
+            raw_operation=operation,
+            confidence=0.5,
+            properties={"resolution": "unresolved_literal"},
+        )
+        builder.add_evidence(
+            "EDGE",
+            edge_id,
+            source_path,
+            line,
+            line,
+            "SQL",
+            snippet,
+            confidence=0.5,
+        )
         builder.add_issue(
             "TABLE_NOT_IMPORTED",
             "ERROR",
@@ -1151,13 +983,14 @@ def _add_external_reference(
     object_name: str,
     operation: str,
     edge_type: str,
+    db_link: str,
     database: str,
     repository: str,
     system_key: str,
 ) -> None:
     raw = object_name.strip().upper()
-    for link in _DB_LINK_RE.finditer(raw):
-        link_name = link.group(1).upper()
+    link_name = db_link
+    if link_name:
         link_node = database_link_id(database, link_name)
         builder.add_node(
             link_node,
@@ -1202,7 +1035,7 @@ def _add_external_reference(
 
 
 def _is_remote_reference(name: str) -> bool:
-    return bool(_DB_LINK_RE.search(name))
+    return "@" in name
 
 
 def _is_external_schema_reference(name: str, schema: str) -> bool:

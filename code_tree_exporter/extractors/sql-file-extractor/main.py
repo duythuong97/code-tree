@@ -35,19 +35,6 @@ _INVALID_CONFIG_RE = re.compile(
     r"INVALID_CONFIG|TODO_CONFIG|missing\s+database\s+mapping|\$\{[^}]+\}",
     re.IGNORECASE,
 )
-_DB_LINK_RE = re.compile(r"@([A-Za-z_][\w$#]*)")
-_EXECUTE_IMMEDIATE_RE = re.compile(r"\bEXECUTE\s+IMMEDIATE\b", re.IGNORECASE)
-_DML_TOKEN_RE = re.compile(
-    r"\b(?:SELECT\b.+?\bFROM|INSERT\s+(?:(?:ALL|FIRST)\s+)?INTO|UPDATE\b.+?\bSET|DELETE\s+FROM|MERGE\s+INTO)\b",
-    re.IGNORECASE | re.DOTALL,
-)
-_PLSQL_DEFINITION_RE = re.compile(
-    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:EDITIONABLE\s+)?(?:PACKAGE|PROCEDURE|FUNCTION|TRIGGER|VIEW|MATERIALIZED\s+VIEW|SYNONYM)\b",
-    re.IGNORECASE,
-)
-_PLSQL_BLOCK_RE = re.compile(
-    r"\bDECLARE\b|\bBEGIN\b.+?\bEND\s*;", re.IGNORECASE | re.DOTALL
-)
 
 
 def main() -> int:
@@ -85,7 +72,7 @@ def extract(config: dict) -> None:
         {
             "source": source,
             "technology": "Python Oracle SQL and SQL*Loader parser",
-            "parser": "extractors.package_support.oracle_parser.OracleSqlParser",
+            "parser": "extractors.package_support.oracle_parser.OraclePlsqlParser",
         },
     )
     builder.files_scanned = len(files)
@@ -125,15 +112,19 @@ def extract(config: dict) -> None:
                 start_line=1,
             )
             continue
-        sql_id = sql_file_id(repository, file.relative)
+        is_loader = file.absolute.suffix.lower() == ".ctl"
+        sql_id = (
+            stable_node_id("loader-control", repository, file.relative)
+            if is_loader
+            else sql_file_id(repository, file.relative)
+        )
+        analysis = None if is_loader else analyze_sql(file.text)
         classification = (
-            "SQL_LOADER_CONTROL_FILE"
-            if file.absolute.suffix.lower() == ".ctl"
-            else _classification(file.text)
+            "SQL_LOADER_CONTROL_FILE" if is_loader else analysis.classification
         )
         builder.add_node(
             sql_id,
-            "SQL_FILE",
+            "LOADER_CONTROL" if is_loader else "SQL_FILE",
             file.absolute.name,
             file.relative,
             file.absolute.name,
@@ -157,14 +148,14 @@ def extract(config: dict) -> None:
                 builder, catalog, sql_id, file.text, file.relative, database
             )
             continue
-        analysis = analyze_sql(file.text)
+        assert analysis is not None
         for ref in analysis.tables:
             line = line_for_offset(file.text, ref.start)
             snippet = line_text(file.text, line)
-            if ref.remote or _is_remote_reference(ref.object_name):
+            if ref.remote:
                 raw = ref.object_name.strip().upper()
-                for link in _DB_LINK_RE.finditer(raw):
-                    link_name = link.group(1).upper()
+                link_name = ref.db_link
+                if link_name:
                     link_node = database_link_id(database, link_name)
                     builder.add_node(
                         link_node,
@@ -262,6 +253,46 @@ def extract(config: dict) -> None:
                 continue
             table_name = leaf_identifier(ref.object_name)
             if not catalog.has_table(database, table_name):
+                owner = owner_identifier(ref.object_name, schema or "UNRESOLVED")
+                target = unresolved_id(
+                    database, f"TABLE:{owner}:{table_name}"
+                )
+                builder.add_node(
+                    target,
+                    "UNRESOLVED_REFERENCE",
+                    table_name,
+                    f"{database}.{owner}.{table_name}",
+                    table_name,
+                    system_key=system_key,
+                    database_key=database,
+                    repository_key=repository,
+                    graph_role="TECHNICAL",
+                    confidence=0.2,
+                    properties={
+                        "database": database,
+                        "schema": owner,
+                        "table": table_name,
+                        "raw_reference": ref.object_name,
+                    },
+                )
+                edge_id = builder.add_edge(
+                    sql_id,
+                    target,
+                    ref.edge_type,
+                    raw_operation=ref.operation,
+                    confidence=0.5,
+                    properties={"resolution": "unresolved_literal"},
+                )
+                builder.add_evidence(
+                    "EDGE",
+                    edge_id,
+                    file.relative,
+                    line,
+                    line,
+                    "SQL",
+                    snippet,
+                    confidence=0.5,
+                )
                 builder.add_issue(
                     "TABLE_NOT_IMPORTED",
                     "ERROR",
@@ -297,7 +328,19 @@ def extract(config: dict) -> None:
                 repository_key=repository,
                 graph_role="TECHNICAL",
             )
-            builder.add_edge(sql_id, seq_node, "USES", raw_operation="NEXTVAL")
+            edge_id = builder.add_edge(
+                sql_id, seq_node, "USES_SEQUENCE", raw_operation=seq.operation
+            )
+            line = line_for_offset(file.text, seq.start)
+            builder.add_evidence(
+                "EDGE",
+                edge_id,
+                file.relative,
+                line,
+                line,
+                "SQL",
+                line_text(file.text, line),
+            )
 
         for call in analysis.calls:
             raw = call.object_name.strip().upper()
@@ -346,19 +389,6 @@ def extract(config: dict) -> None:
                 source_path=file.relative,
                 start_line=line,
             )
-        for match in _EXECUTE_IMMEDIATE_RE.finditer(file.text):
-            if match.start() not in set(analysis.dynamic_offsets):
-                line = line_for_offset(file.text, match.start())
-                builder.add_issue(
-                    "DYNAMIC_SQL",
-                    "INFO",
-                    "Dynamic SQL was analyzed with best-effort literal resolution",
-                    source_node_id=sql_id,
-                    raw_reference="EXECUTE IMMEDIATE",
-                    database_key=database,
-                    source_path=file.relative,
-                    start_line=line,
-                )
         for offset in analysis.parse_error_offsets:
             line = line_for_offset(file.text, offset)
             builder.add_issue(
@@ -390,75 +420,12 @@ def extract(config: dict) -> None:
     builder.write(output)
 
 
-def _classification(text: str) -> str:
-    scan = _mask_noncode(text)
-    has_plsql = bool(_PLSQL_DEFINITION_RE.search(scan) or _PLSQL_BLOCK_RE.search(scan))
-    has_dml = bool(_DML_TOKEN_RE.search(scan))
-    if has_plsql and has_dml:
-        return "MIXED_SCRIPT"
-    if has_plsql:
-        return "PLSQL_DEFINITION"
-    if has_dml:
-        return "DML_SCRIPT"
-    return "UNKNOWN_SQL"
 
 
-def _mask_noncode(text: str) -> str:
-    chars = list(text)
-    index = 0
-    state = "code"
-    while index < len(chars):
-        pair = text[index : index + 2]
-        if state == "code":
-            if pair == "--":
-                state = "line_comment"
-                chars[index : index + 2] = [" ", " "]
-                index += 2
-                continue
-            if pair == "/*":
-                state = "block_comment"
-                chars[index : index + 2] = [" ", " "]
-                index += 2
-                continue
-            if text[index] == "'":
-                state = "string"
-                chars[index] = " "
-            index += 1
-            continue
-        if state == "line_comment":
-            if text[index] == "\n":
-                state = "code"
-            else:
-                chars[index] = " "
-            index += 1
-            continue
-        if state == "block_comment":
-            if pair == "*/":
-                chars[index : index + 2] = [" ", " "]
-                state = "code"
-                index += 2
-            else:
-                if text[index] != "\n":
-                    chars[index] = " "
-                index += 1
-            continue
-        if text[index] == "'":
-            chars[index] = " "
-            if index + 1 < len(text) and text[index + 1] == "'":
-                chars[index + 1] = " "
-                index += 2
-            else:
-                state = "code"
-                index += 1
-        else:
-            if text[index] != "\n":
-                chars[index] = " "
-            index += 1
-    return "".join(chars)
 
 
 def _is_remote_reference(name: str) -> bool:
-    return bool(_DB_LINK_RE.search(name))
+    return "@" in name
 
 
 def _is_external_schema_reference(name: str, schema: str) -> bool:

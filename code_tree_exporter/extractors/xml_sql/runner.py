@@ -15,6 +15,7 @@ from code_tree_exporter.extractors.package_support.package_writer import (
 )
 from code_tree_exporter.extractors.package_support.semantic_tree_v3 import analysis_notes
 from code_tree_exporter.extractors.package_support.sql_analyzer import analyze_sql
+from code_tree_exporter.extractors.xml_sql.elements import local_tag, statement_elements
 from code_tree_exporter.extractors.xml_sql.includes import expanded_sql
 from code_tree_exporter.extractors.xml_sql.semantic_tree import element_lines, statement_semantic_tree
 
@@ -73,7 +74,7 @@ def extract(config: dict) -> None:
         builder.add_evidence("NODE", owner_id, file.relative, root_line, root_line, "DECLARATION", line_text(file.text, root_line))
         namespace = root.get("namespace", "").strip()
         fragments: dict[str, tuple[str, ElementTree.Element]] = {}
-        for fragment in (item for item in root.iter() if _tag(item) == "sql"):
+        for fragment in (item for item in root.iter() if local_tag(item) == "sql"):
             fragment_id = fragment.get("id", "").strip()
             if not fragment_id:
                 continue
@@ -81,12 +82,7 @@ def extract(config: dict) -> None:
             fragments.setdefault(fragment_id, (canonical, fragment))
             fragments.setdefault(canonical, (canonical, fragment))
         queries: set[str] = set()
-        for statement in (
-            item
-            for item in root.iter()
-            if _tag(item)
-            in {"select", "insert", "update", "delete", "merge", "statement"}
-        ):
+        for statement in statement_elements(root):
             statement_id = statement.get("id", "").strip()
             line = lines.get(id(statement), 1)
             if not namespace or not statement_id:
@@ -117,10 +113,15 @@ def extract(config: dict) -> None:
                     "classification": "XML_SQL_STATEMENT",
                     "namespace": namespace,
                     "statement_id": statement_id,
-                    "mapper_tag": _tag(statement),
+                    "mapper_tag": local_tag(statement),
                 },
             )
             builder.add_edge(owner_id, statement_node_id, "CONTAINS", graph_layer="STRUCTURAL")
+
+            # Link XML mapper to C# caller
+            csharp_caller_id = stable_node_id("method", repository, query)
+            builder.add_edge(csharp_caller_id, statement_node_id, "CALLS", graph_layer="STRUCTURAL")
+
             builder.add_evidence("NODE", statement_node_id, file.relative, line, line, "DECLARATION", line_text(file.text, line))
             expanded, include_issues = expanded_sql(statement, fragments)
             sql = " ".join(expanded.split())
@@ -221,10 +222,6 @@ def extract(config: dict) -> None:
                 properties, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             )
     builder.write(Path(config["output"]))
-
-
-def _tag(element: ElementTree.Element) -> str:
-    return element.tag.rsplit("}", 1)[-1].lower()
 
 
 
