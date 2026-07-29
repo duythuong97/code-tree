@@ -1,0 +1,56 @@
+{
+  "version": "3",
+  "name": "ORDER_SYSTEM",
+  "root": "${SOURCE_ROOT}",
+  "output": "${EXPORT_OUTPUT}",
+  "catalog": {
+    "folder": "./catalog",
+    "autoImport": true,
+    "strict": true,
+    "duplicatePolicy": "error",
+    "encoding": "auto"
+  },
+  "enrichment": {
+    "enabled": true,
+    "flowMaxDepth": 8,
+    "maxFlowTargetsPerEntry": 100,
+    "minimumResolutionConfidence": 0.85
+  },
+  "sources": [
+    {
+      "name": "order-ui",
+      "type": "angular",
+      "system": "ORDER_SYSTEM",
+      "repository": "order-ui",
+      "folders": ["ui/order"]
+    },
+    {
+      "name": "order-api",
+      "type": "dotnet-api",
+      "system": "ORDER_SYSTEM",
+      "repository": "order-api",
+      "database": "DB1",
+      "schema": "APP",
+      "folders": ["api/order"]
+    },
+    {
+      "name": "order-batch",
+      "type": "dotnet-batch",
+      "system": "ORDER_SYSTEM",
+      "repository": "order-batch",
+      "database": "DB1",
+      "schema": "APP",
+      "folders": ["batch/order"]
+    },
+    {
+      "name": "order-plsql",
+      "type": "oracle-plsql",
+      "system": "ORDER_SYSTEM",
+      "repository": "order-db",
+      "database": "DB1",
+      "schema": "APP",
+      "semanticDetail": "summary",
+      "folders": ["database/plsql"]
+    }
+  ]
+}

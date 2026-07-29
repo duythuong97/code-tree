@@ -30,7 +30,7 @@ from code_tree_exporter.extractors.package_support.sql_analyzer import analyze_s
 from code_tree_exporter.extractors.package_support.semantic_tree import attach_sql_semantic_tree
 from code_tree_exporter.extractors.package_support.sql_loader import extract_sql_loader
 
-_VERSION = "1.0.0"
+_VERSION = "3.0.0"
 _INVALID_CONFIG_RE = re.compile(
     r"INVALID_CONFIG|TODO_CONFIG|missing\s+database\s+mapping|\$\{[^}]+\}",
     re.IGNORECASE,
@@ -73,6 +73,13 @@ def extract(config: dict) -> None:
             "source": source,
             "technology": "Python Oracle SQL and SQL*Loader parser",
             "parser": "extractors.package_support.oracle_parser.OraclePlsqlParser",
+            "extractorContract": "3.0",
+            "capabilities": [
+                "sql-input-output",
+                "database-lineage",
+                "column-lineage",
+                "loader-file-mapping",
+            ],
         },
     )
     builder.files_scanned = len(files)

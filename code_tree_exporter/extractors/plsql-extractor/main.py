@@ -46,7 +46,7 @@ from code_tree_exporter.extractors.package_support.semantic_tree import (
 )
 from code_tree_exporter.extractors.package_support.sql_analyzer import analyze_sql
 
-_VERSION = "1.0.0"
+_VERSION = "3.0.0"
 _EXTERNAL_API_RE = re.compile(
     r"external-api:([A-Za-z_][\w$#-]*):([A-Z]+):([^\s]+)", re.IGNORECASE
 )
@@ -119,6 +119,13 @@ def extract(config: dict) -> None:
             "technology": "Python + ANTLR4 runtime Oracle PL/SQL parser",
             "parser": "extractors.package_support.oracle_parser.OraclePlsqlParser",
             "semanticDetail": semantic_detail,
+            "extractorContract": "3.0",
+            "capabilities": [
+                "routine-input-output",
+                "database-lineage",
+                "column-lineage",
+                "semantic-summary",
+            ],
         },
     )
     builder.files_scanned = len(files)

@@ -343,6 +343,129 @@ class KnowledgeStore:
             extra={"memory": matches},
         )
 
+    def health(self) -> dict[str, object]:
+        if not self._table_exists("quality_metrics"):
+            return self._response(
+                "V3 quality metrics are unavailable; rebuild with Extractor V3."
+            )
+        rows = self._query_rows(
+            "SELECT * FROM quality_metrics "
+            "ORDER BY scope_type, scope_key, metric_name"
+        )
+        global_metrics = {
+            row["metric_name"]: _numeric_value(row["metric_value"])
+            for row in rows
+            if row["scope_type"] == "GLOBAL" and row["scope_key"] == "global"
+        }
+        return self._response(
+            f"Loaded {len(rows)} V3 quality metric(s).",
+            extra={"metrics": global_metrics, "metric_rows": rows},
+        )
+
+    def input_output(self, node_id: str) -> dict[str, object]:
+        if not self._table_exists("io_items"):
+            return self._response(
+                "V3 input/output data is unavailable; rebuild with Extractor V3."
+            )
+        resolved = self._resolve_identifier("nodes", "node_id", node_id)
+        if not resolved:
+            return self._response("Node not found.")
+        items = self._query_rows(
+            "SELECT * FROM io_items WHERE owner_node_id = ? "
+            "ORDER BY direction, ordinal, io_id",
+            (int(resolved),),
+        )
+        links = self._query_rows(
+            "SELECT l.*, n.stable_id AS target_stable_id, "
+            "n.node_type AS target_node_type, n.qualified_name AS target_qualified_name "
+            "FROM io_links l JOIN nodes n ON n.node_id = l.target_node_id "
+            "WHERE l.io_id IN (SELECT io_id FROM io_items WHERE owner_node_id = ?) "
+            "ORDER BY l.io_id, l.io_link_id",
+            (int(resolved),),
+        )
+        return self._response(
+            f"Found {len(items)} input/output item(s) for node {node_id}.",
+            extra={"io_items": items, "io_links": links},
+        )
+
+    def trace_flow(self, node_id: str, *, limit: int = 100) -> dict[str, object]:
+        if not self._table_exists("flows"):
+            return self._response(
+                "V3 materialized flows are unavailable; rebuild with Extractor V3."
+            )
+        resolved = self._resolve_identifier("nodes", "node_id", node_id)
+        if not resolved:
+            return self._response("Node not found.")
+        flows = self._query_rows(
+            "SELECT DISTINCT f.* FROM flows f "
+            "LEFT JOIN flow_steps s ON s.flow_id = f.flow_id "
+            "WHERE f.start_node_id = ? OR f.target_node_id = ? OR s.node_id = ? "
+            "ORDER BY f.flow_id LIMIT ?",
+            (int(resolved), int(resolved), int(resolved), limit),
+        )
+        flow_ids = [int(row["flow_id"]) for row in flows]
+        steps: list[dict[str, str]] = []
+        flow_io: list[dict[str, str]] = []
+        if flow_ids:
+            placeholders = ",".join("?" for _ in flow_ids)
+            steps = self._query_rows(
+                "SELECT s.*, n.stable_id AS node_stable_id, "
+                "n.node_type, n.qualified_name "
+                "FROM flow_steps s JOIN nodes n ON n.node_id = s.node_id "
+                f"WHERE s.flow_id IN ({placeholders}) "
+                "ORDER BY s.flow_id, s.step_index",
+                tuple(flow_ids),
+            )
+            flow_io = self._query_rows(
+                "SELECT fi.*, i.stable_id AS io_stable_id, i.kind, i.name, "
+                "i.owner_node_id FROM flow_io fi "
+                "JOIN io_items i ON i.io_id = fi.io_id "
+                f"WHERE fi.flow_id IN ({placeholders}) "
+                "ORDER BY fi.flow_id, fi.direction, fi.io_id",
+                tuple(flow_ids),
+            )
+        return self._response(
+            f"Found {len(flows)} materialized flow(s) for node {node_id}.",
+            extra={"flows": flows, "flow_steps": steps, "flow_io": flow_io},
+        )
+
+    def unresolved(self, *, limit: int = 200) -> dict[str, object]:
+        nodes = self._query_rows(
+            "SELECT * FROM nodes WHERE node_type IN "
+            "('UNRESOLVED_REFERENCE', 'EXTERNAL_DATABASE_OBJECT') "
+            "ORDER BY node_id LIMIT ?",
+            (limit,),
+        )
+        candidates: list[dict[str, str]] = []
+        if self._table_exists("resolution_candidates"):
+            candidates = self._query_rows(
+                "SELECT r.*, n.stable_id AS candidate_stable_id, "
+                "n.node_type AS candidate_node_type, "
+                "n.qualified_name AS candidate_qualified_name "
+                "FROM resolution_candidates r "
+                "JOIN nodes n ON n.node_id = r.candidate_node_id "
+                "ORDER BY r.reference_node_id, r.rank LIMIT ?",
+                (limit * 10,),
+            )
+        return self._response(
+            f"Found {len(nodes)} unresolved/external reference node(s).",
+            nodes=nodes,
+            extra={"resolution_candidates": candidates},
+        )
+
+    def catalog_status(self) -> dict[str, object]:
+        if not self._table_exists("catalog_files"):
+            return self._response(
+                "V3 catalog metadata is unavailable; no catalog was published."
+            )
+        rows = self._query_rows(
+            "SELECT * FROM catalog_files ORDER BY path"
+        )
+        return self._response(
+            f"Found {len(rows)} catalog file record(s).",
+            extra={"catalog_files": rows},
+        )
+
     def _trace_response(
         self,
         starts: list[dict[str, str]],
@@ -513,6 +636,16 @@ class KnowledgeStore:
         finally:
             connection.close()
 
+    def _table_exists(self, table: str) -> bool:
+        connection = sqlite3.connect(self.database_uri, uri=True)
+        try:
+            return connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone() is not None
+        finally:
+            connection.close()
+
     def _memory_record(self, node_id: str) -> dict[str, object] | None:
         locator = self.index.get("memoryByNodeId", {}).get(node_id)
         if not isinstance(locator, dict):
@@ -589,6 +722,17 @@ def main(argv: list[str] | None = None) -> int:
     search.add_argument("--kind", default="")
     search.add_argument("--source", default="")
 
+    commands.add_parser("health")
+
+    input_output = commands.add_parser("input-output", aliases=["inputOutput"])
+    input_output.add_argument("--node-id", required=True)
+
+    trace_flow = commands.add_parser("trace-flow", aliases=["traceFlow"])
+    trace_flow.add_argument("--node-id", required=True)
+
+    commands.add_parser("unresolved")
+    commands.add_parser("catalog-status", aliases=["catalogStatus"])
+
     args = parser.parse_args(argv)
     try:
         store = KnowledgeStore(Path(args.output))
@@ -620,6 +764,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command in {"explain-node", "explainNode"}:
             result = store.explain_node(args.node_id)
+        elif args.command == "health":
+            result = store.health()
+        elif args.command in {"input-output", "inputOutput"}:
+            result = store.input_output(args.node_id)
+        elif args.command in {"trace-flow", "traceFlow"}:
+            result = store.trace_flow(args.node_id)
+        elif args.command == "unresolved":
+            result = store.unresolved()
+        elif args.command in {"catalog-status", "catalogStatus"}:
+            result = store.catalog_status()
         else:
             result = store.search_memory(
                 args.text, kind=args.kind, source=args.source
@@ -635,6 +789,14 @@ def _optional_int(value: str | None) -> int | None:
         return int(value) if value else None
     except (TypeError, ValueError):
         return None
+
+
+def _numeric_value(value: str) -> int | float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0
+    return int(parsed) if parsed.is_integer() else parsed
 
 
 def _sqlite_table(value: str) -> str:

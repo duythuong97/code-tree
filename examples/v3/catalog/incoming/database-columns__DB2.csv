@@ -1,0 +1,2 @@
+database_key,schema_name,object_name,column_name,ordinal_position,data_type,data_length,data_precision,data_scale,nullable,default_value,primary_key,comment
+DB2,MASTER,CUSTOMERS,CUSTOMER_ID,1,VARCHAR2,32,,,N,,Y,Customer identifier

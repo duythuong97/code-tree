@@ -18,6 +18,17 @@ query CLI.
 - `issues`: diagnostics with an optional integer `source_node_id`.
 - `sources`: decoded source-file metadata.
 - `metadata`: database contract and generation metadata.
+- `catalog_files`: V3 catalog file checksum, profile and import/rejection counts.
+- `io_items`: normalized inputs and outputs owned by entry points or meaningful
+  components.
+- `io_links`: mappings from an I/O item to a graph target such as a table,
+  column, API, job or data file.
+- `resolution_candidates`: ranked candidates retained for unresolved/external
+  references instead of silently forcing an ambiguous link.
+- `flows`: bounded materialized flow from an entry node to a DB/external target.
+- `flow_steps`: ordered nodes and incoming edges for each materialized flow.
+- `flow_io`: I/O items participating in a materialized flow.
+- `quality_metrics`: global and per-source extraction metrics.
 
 All graph tables include `package_key`; logical source partitions therefore
 remain queryable without duplicating graph files. `properties_json` is a JSON
@@ -59,7 +70,20 @@ rewrites rather than rescanning the graph once per missing node.
 - Every descriptive `stable_id` is unique within its table.
 - Query indexes cover node type/name, edge source/target/type, evidence target,
   comment owner, issue source/package/type, and logical package scope.
-- `PRAGMA user_version` is `2` and `PRAGMA foreign_key_check` must return no rows.
+- `PRAGMA user_version` is `3` for V3 output and `PRAGMA foreign_key_check` must
+  return no rows.
+
+## V3 compatibility
+
+V3 creates the V2 graph database first, then adds the V3 tables in the same
+SQLite file. Existing `nodes`, `edges`, `evidence`, `comments`, `issues`,
+`sources` and `metadata` columns remain unchanged. V3 updates metadata and the
+root manifest contract version to `3.0`, while graph stable IDs and deterministic
+63-bit numeric IDs retain identity version `2`.
+
+`quality-report.json` and `QUALITY_REPORT.md` summarize catalog status,
+unresolved references, confidence and flow coverage. Their checksums, together
+with the final `graph.sqlite` checksum, are published in `manifest.json`.
 
 Extractor subprocesses may still exchange temporary CSV package files with the
 pipeline. Those files are internal staging data and are not published output.

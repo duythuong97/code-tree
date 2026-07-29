@@ -1,0 +1,2 @@
+database_key,schema_name,object_name,object_type,status,comment
+DB2,MASTER,CUSTOMERS,TABLE,VALID,Customer master

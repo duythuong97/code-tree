@@ -1,0 +1,2 @@
+database_key,schema_name,object_name,column_name,ordinal_position,data_type,data_length,data_precision,data_scale,nullable,default_value,primary_key,comment
+DB1,APP,ORDERS,ORDER_ID,1,NUMBER,,18,0,N,,Y,Order identifier

@@ -15,7 +15,7 @@ NODE_TYPES = frozenset({
     "ANGULAR_PROJECT", "ANGULAR_COMPONENT", "ANGULAR_SERVICE", "API_CALL_REFERENCE",
     "DOTNET_SOLUTION", "DOTNET_PROJECT", "CSHARP_TYPE", "CONTROLLER", "SERVICE", "REPOSITORY",
     "EXECUTABLE_ENTRY_POINT", "LOCAL_ROUTINE", "METHOD", "INLINE_SQL", "SEQUENCE", "SYNONYM", "DATABASE_LINK",
-    "COLUMN", "FILE", "SYSTEM", "APPLICATION", "DATA_FILE",
+    "COLUMN", "FILE", "SYSTEM", "APPLICATION", "DATA_FILE", "DATABASE_SCHEMA",
     "XML_SQL_MAPPER", "MAPPER_STATEMENT", "XML_SQL_FRAGMENT",
     # v2 knowledge contract names. Legacy producer names above remain valid so
     # existing extractor packages can be merged during the additive migration.
@@ -46,7 +46,9 @@ ISSUE_TYPES = frozenset(
     "MERGE_CONFLICT DUPLICATE_MAPPER_STATEMENT "
     "AUTO_DISCOVERED_XML_SQL_TAG UNRESOLVED_XML_INCLUDE "
     "UNRESOLVED_REFERENCE SEMANTIC_TREE_UNAVAILABLE FILE_TOO_LARGE TIMEOUT "
-    "FALLBACK_USED NO_API_ENDPOINTS".split()
+    "FALLBACK_USED NO_API_ENDPOINTS "
+    "CATALOG_UNKNOWN_SCHEMA CATALOG_INVALID_FILE CATALOG_INVALID_ROW "
+    "CATALOG_CONFLICT CATALOG_REFERENCE_MISSING CATALOG_DATABASE_MISMATCH".split()
 )
 
 NODE_ID_PREFIXES = {
@@ -89,6 +91,7 @@ NODE_ID_PREFIXES = {
     "SEQUENCE": frozenset({"sequence"}),
     "SYNONYM": frozenset({"synonym"}),
     "DATABASE_LINK": frozenset({"database-link"}),
+    "DATABASE_SCHEMA": frozenset({"database-schema"}),
     "FILE": frozenset({"file"}),
     "SYSTEM": frozenset({"system"}),
     "APPLICATION": frozenset({"application"}),

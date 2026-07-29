@@ -30,7 +30,7 @@ from code_tree_exporter.extractors.package_support.package_writer import (
     line_text,
 )
 
-_VERSION = "2.0.0-fallback"
+_VERSION = "3.0.0-fallback"
 _CLASS_RE = re.compile(
     r"@(?P<decorator>Component|Injectable)\s*\((?P<meta>.*?)\)\s*"
     r"(?:export\s+)?class\s+(?P<name>[A-Za-z_]\w*)",
@@ -92,6 +92,8 @@ def extract(config: dict) -> None:
             "source": source,
             "technology": "safe literal/declaration fallback",
             "degraded": True,
+            "extractorContract": "3.0",
+            "capabilities": ["route-input-output", "api-client-lineage"],
         },
     )
     builder.files_scanned = len(files)

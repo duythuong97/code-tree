@@ -1,0 +1,28 @@
+{
+  "name": "scheduler-jobnet",
+  "catalogType": "batch-jobs",
+  "match": {
+    "filename": "scheduler-*.csv",
+    "requiredHeaders": ["network", "step", "program", "previous"]
+  },
+  "fields": {
+    "jobnet_id": "network",
+    "job_id": "step",
+    "predecessor_job_id": "previous",
+    "executable_name": "program"
+  },
+  "transforms": {
+    "jobnet_id": ["trim", "upper"],
+    "job_id": ["trim", "upper"]
+  },
+  "output": {
+    "filename": "jobnet.csv",
+    "fields": [
+      "jobnet_id",
+      "job_id",
+      "predecessor_job_id",
+      "executable_name"
+    ],
+    "identity": ["jobnet_id", "job_id"]
+  }
+}

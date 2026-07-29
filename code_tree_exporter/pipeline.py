@@ -83,6 +83,24 @@ def run_pipeline(config_path: Path) -> Path:
         prefix=f".{output.name}-staging-", dir=staging_parent
     ) as temporary:
         temporary_root = Path(temporary)
+        from .v3.catalog import prepare_catalog
+
+        configured_input = config.get("inputData")
+        existing_input = (
+            Path(configured_input)
+            if isinstance(configured_input, str) and Path(configured_input).is_dir()
+            else None
+        )
+        catalog = prepare_catalog(
+            config,
+            config_dir=config_path.parent,
+            staging_root=temporary_root,
+            existing_input=existing_input,
+        )
+        if catalog:
+            catalog.merge_into(
+                graph, system_key=str(config.get("name") or root.name)
+            )
         packages_root = temporary_root / "packages"
         prepared_root = temporary_root / "sources"
         packages_root.mkdir()
@@ -136,6 +154,11 @@ def run_pipeline(config_path: Path) -> Path:
                 extractor_root,
                 package_output,
                 valid_paths,
+                input_data_root=_v3_input_data_root(
+                    source,
+                    catalog.normalized_root if catalog else None,
+                    temporary_root / "catalog-sources" / source_name,
+                ),
             )
             extractor_config_path = temporary_root / f"{source_name}.json"
             extractor_config_path.write_text(
@@ -177,8 +200,10 @@ def run_pipeline(config_path: Path) -> Path:
                 )
 
         from .linker import run_linker
+        from .v3.hierarchy import enrich_hierarchy
 
         run_linker(graph)
+        enrich_hierarchy(graph)
         graph.materialize_structure()
         final_staging = temporary_root / "final"
         final_staging.mkdir()
@@ -200,8 +225,70 @@ def run_pipeline(config_path: Path) -> Path:
         render_file_tree(graph, final_staging / "file-trees", max_tree_lines)
         if config.get("combinedProjection", output_mode == "flat"):
             render_system_tree(graph, final_staging / "SYSTEM_TREE.md", max_tree_lines)
+        from .v3.publisher import publish_v3
+
+        publish_v3(final_staging, catalog=catalog, config=config)
         replace_directory(final_staging, output)
     return output
+
+
+def validate_pipeline_config(config_path: Path) -> dict[str, object]:
+    config_path = config_path.expanduser().resolve()
+    load_dotenv(config_path.parent / ".env", Path.cwd() / ".env")
+    config = _load_config(config_path)
+    root = _absolute_directory(config, "root")
+    output = _absolute_path(config, "output")
+    if output == root or root in output.parents:
+        raise ValueError("output must be outside root")
+    sources = config.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("sources must be a non-empty array")
+    validated_sources = [
+        _validate_source(source, index) for index, source in enumerate(sources)
+    ]
+    names = [str(source["name"]) for source in validated_sources]
+    if len(names) != len(set(names)):
+        raise ValueError("sources[].name must be unique")
+    for source in validated_sources:
+        extractor_spec(str(source["type"]))
+    _validate_data_paths(config, validated_sources, output)
+    output_mode = str(config.get("outputMode", "flat")).strip().lower()
+    if output_mode not in {"flat", "partitioned"}:
+        raise ValueError("outputMode must be 'flat' or 'partitioned'")
+    limits = _resolved_limits(config)
+    configured_input = config.get("inputData")
+    existing_input = (
+        Path(configured_input)
+        if isinstance(configured_input, str) and Path(configured_input).is_dir()
+        else None
+    )
+    with tempfile.TemporaryDirectory(prefix="code-tree-v3-validate-") as temporary:
+        from .v3.catalog import prepare_catalog
+
+        catalog = prepare_catalog(
+            config,
+            config_dir=config_path.parent,
+            staging_root=Path(temporary),
+            existing_input=existing_input,
+        )
+        catalog_summary = {
+            "files": len(catalog.files),
+            "tables": len(catalog.tables),
+            "columns": len(catalog.columns),
+            "issues": len(catalog.issues),
+        } if catalog else None
+    return {
+        "valid": True,
+        "version": "3.0",
+        "name": str(config.get("name") or root.name),
+        "root": str(root),
+        "output": str(output),
+        "outputMode": output_mode,
+        "sources": names,
+        "sourceTypes": sorted({str(source["type"]) for source in validated_sources}),
+        "limits": limits,
+        "catalog": catalog_summary,
+    }
 
 
 def _load_config(path: Path) -> dict:
@@ -229,6 +316,26 @@ def _load_config(path: Path) -> dict:
                         else path.parent / candidate
                     ).resolve()
                 )
+    catalog = value.get("catalog")
+    if isinstance(catalog, str) and catalog:
+        candidate = Path(catalog).expanduser()
+        catalog = {
+            "folder": str(
+                (
+                    candidate if candidate.is_absolute() else path.parent / candidate
+                ).resolve()
+            )
+        }
+        value["catalog"] = catalog
+    if isinstance(catalog, dict):
+        configured = catalog.get("folder")
+        if isinstance(configured, str) and configured:
+            candidate = Path(configured).expanduser()
+            catalog["folder"] = str(
+                (
+                    candidate if candidate.is_absolute() else path.parent / candidate
+                ).resolve()
+            )
     return value
 
 
@@ -291,8 +398,12 @@ def _validate_data_paths(config: dict, sources: list[dict], output: Path) -> Non
             for index, source in enumerate(sources)
         ),
     ]
+    catalog = config.get("catalog")
+    if isinstance(catalog, dict):
+        owners.append((catalog, "catalog.folder"))
     for owner, label in owners:
-        value = owner.get("inputData")
+        key = "folder" if label == "catalog.folder" else "inputData"
+        value = owner.get(key)
         if not isinstance(value, str) or not value:
             continue
         candidate = Path(value).resolve()
@@ -619,6 +730,8 @@ def _extractor_config(
     staging_root: Path,
     output: Path,
     valid_paths: list[str],
+    *,
+    input_data_root: Path | None = None,
 ) -> dict:
     result = {
         key: value
@@ -635,10 +748,13 @@ def _extractor_config(
             "system": str(source.get("system") or source["name"]),
             "files": valid_paths,
             "inputData": str(
-                Path(
-                    source.get("inputData")
-                    or global_config.get("inputData")
-                    or staging_root
+                (
+                    input_data_root
+                    or Path(
+                        source.get("inputData")
+                        or global_config.get("inputData")
+                        or staging_root
+                    )
                 ).resolve()
             ),
         }
@@ -651,6 +767,24 @@ def _extractor_config(
     if spec.config_type in {"dotnet-api", "dotnet-batch"}:
         result["xmlMapperQueries"] = _xml_mapper_queries(staging_root, valid_paths)
     return result
+
+
+def _v3_input_data_root(
+    source: dict,
+    catalog_root: Path | None,
+    overlay_root: Path,
+) -> Path | None:
+    if catalog_root is None:
+        return None
+    configured = source.get("inputData")
+    if not isinstance(configured, str) or not configured:
+        return catalog_root
+    source_root = Path(configured)
+    if not source_root.is_dir():
+        return catalog_root
+    shutil.copytree(source_root, overlay_root, dirs_exist_ok=True)
+    shutil.copytree(catalog_root, overlay_root, dirs_exist_ok=True)
+    return overlay_root
 
 
 def _staged_folders(folders: list) -> list:

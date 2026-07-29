@@ -1,6 +1,6 @@
 {
   "contract": "code-map-sqlite",
-  "version": "2.0",
-  "compatibility": "sqlite-primary-with-stable-id-lookup",
+  "version": "3.0",
+  "compatibility": "additive-v3-over-v2-package-contract",
   "identity_version": 2
 }

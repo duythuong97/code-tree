@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "code-tree-exporter"
-version = "0.4.0"
+version = "3.0.0"
 description = "Extract source code into a queryable graph, codebase memory, and RAG knowledge"
 requires-python = ">=3.10"
 dependencies = ["antlr4-python3-runtime==4.13.2"]

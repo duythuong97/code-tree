@@ -18,7 +18,7 @@
     "metadata"
   ],
   "properties": {
-    "contractVersion": {"const": "2.0"},
+    "contractVersion": {"const": "3.0"},
     "storage": {"const": "sqlite"},
     "extractor": {
       "type": "object",
@@ -67,7 +67,9 @@
         "database": {"const": "graph.sqlite"},
         "graphIndex": {"const": "graph-index.json"},
         "memoryManifest": {"const": "codebase-memory/manifest.json"},
-        "knowledgeManifest": {"const": "knowledge/manifest.json"}
+        "knowledgeManifest": {"const": "knowledge/manifest.json"},
+        "qualityReport": {"const": "quality-report.json"},
+        "qualityReportMarkdown": {"const": "QUALITY_REPORT.md"}
       }
     },
     "statistics": {
@@ -80,7 +82,20 @@
         "edges": {"type": "integer", "minimum": 0},
         "evidence": {"type": "integer", "minimum": 0},
         "comments": {"type": "integer", "minimum": 0},
-        "issues": {"type": "integer", "minimum": 0}
+        "issues": {"type": "integer", "minimum": 0},
+        "ioItems": {"type": "integer", "minimum": 0},
+        "ioLinks": {"type": "integer", "minimum": 0},
+        "flows": {"type": "integer", "minimum": 0},
+        "incompleteFlows": {"type": "integer", "minimum": 0},
+        "resolutionCandidates": {"type": "integer", "minimum": 0},
+        "unresolvedReferences": {"type": "integer", "minimum": 0},
+        "ambiguousIssues": {"type": "integer", "minimum": 0},
+        "lowConfidenceEdges": {"type": "integer", "minimum": 0},
+        "catalogFiles": {"type": "integer", "minimum": 0},
+        "catalogTables": {"type": "integer", "minimum": 0},
+        "catalogColumns": {"type": "integer", "minimum": 0},
+        "catalogRejectedFiles": {"type": "integer", "minimum": 0},
+        "catalogRejectedRows": {"type": "integer", "minimum": 0}
       }
     },
     "checksums": {
@@ -89,6 +104,24 @@
       "additionalProperties": false,
       "properties": {
         "graph.sqlite": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sha256", "bytes"],
+          "properties": {
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          }
+        },
+        "quality-report.json": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sha256", "bytes"],
+          "properties": {
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "bytes": {"type": "integer", "minimum": 0}
+          }
+        },
+        "QUALITY_REPORT.md": {
           "type": "object",
           "additionalProperties": false,
           "required": ["sha256", "bytes"],

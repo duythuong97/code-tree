@@ -53,7 +53,7 @@ class SourceFile:
     database: str = ""
 
 class Catalog:
-    def __init__(self, tables: dict[str, set[str]], procedures: set[str] | None = None) -> None:
+    def __init__(self, tables: dict[str, dict[str, set[str]]], procedures: set[str] | None = None) -> None:
         self.tables = tables
         self.procedures = procedures or set()
 
@@ -69,12 +69,17 @@ class Catalog:
                         continue
                     table = normalize_oracle_identifier(row["table_code"])
                     columns: set[str] = set()
-                    child = input_root / "tables" / f"{row['table_code']}.csv"
+                    configured = str(row.get("columns_file") or "").strip()
+                    child = (
+                        input_root / configured
+                        if configured
+                        else input_root / "tables" / f"{row['table_code']}.csv"
+                    )
                     if child.exists():
                         with child.open(encoding="utf-8", newline="") as column_handle:
                             columns = {normalize_oracle_identifier(item["column_code"]) for item in csv.DictReader(column_handle)}
                     tables.setdefault(db, {})[table] = columns
-        return cls(tables)  # type: ignore[arg-type]
+        return cls(tables)
 
     def has_table(self, database: str, table: str) -> bool:
         db = normalize_oracle_identifier(database)
@@ -490,7 +495,12 @@ def load_authoritative_ids(input_root: Path) -> set[str]:
         with table_path.open(encoding="utf-8", newline="") as handle:
             for row in csv.DictReader(handle):
                 ids.add(table_id(row["database"], row["table_code"]))
-                child = input_root / "tables" / f"{row['table_code']}.csv"
+                configured = str(row.get("columns_file") or "").strip()
+                child = (
+                    input_root / configured
+                    if configured
+                    else input_root / "tables" / f"{row['table_code']}.csv"
+                )
                 if child.exists():
                     with child.open(encoding="utf-8", newline="") as column_handle:
                         ids.update(column_id(row["database"], row["table_code"], item["column_code"]) for item in csv.DictReader(column_handle))

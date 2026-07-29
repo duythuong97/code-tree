@@ -5,6 +5,45 @@ Pipeline tạo codebase knowledge từ nhiều source unit. `graph.sqlite` là n
 là projection nhỏ cho Copilot Studio/RAG. Pipeline vẫn giữ comment, encoding,
 evidence và file tree để truy ngược về source.
 
+V3 bổ sung catalog auto-import, hierarchy từ system xuống database/application,
+input/output, materialized flow, resolution candidates và quality metrics mà
+không đổi stable/numeric ID của graph V2. Plan đầy đủ nằm tại
+[`docs/V3_PLAN.md`](docs/V3_PLAN.md); config và bốn CSV bootstrap nằm trong
+[`examples/v3`](examples/v3).
+
+## V3 bootstrap
+
+Khởi tạo catalog bằng bốn file:
+
+```text
+catalog/incoming/database-tables__DB1.csv
+catalog/incoming/database-columns__DB1.csv
+catalog/incoming/database-tables__DB2.csv
+catalog/incoming/database-columns__DB2.csv
+```
+
+Thêm vào config:
+
+```json
+{
+  "catalog": {
+    "folder": "./catalog",
+    "autoImport": true,
+    "strict": true,
+    "duplicatePolicy": "error"
+  },
+  "enrichment": {
+    "flowMaxDepth": 8,
+    "maxFlowTargetsPerEntry": 100,
+    "minimumResolutionConfidence": 0.85
+  }
+}
+```
+
+Mỗi CSV có structure khác phải có JSON profile trong `catalog/profiles`. Profile
+map header nguồn sang schema chuẩn và có thể compile thành `jobnet.csv`,
+`executable-mappings.csv` hoặc file legacy khác; importer không tự đoán schema.
+
 ## Config
 
 ```json
@@ -110,8 +149,13 @@ và ghi `SEMANTIC_TREE_UNAVAILABLE`.
 Sau khi cài package, cả macOS và Windows:
 
 ```text
-code-tree-exporter --config <absolute-config-path>
+code-tree-exporter validate --config <absolute-config-path>
+code-tree-exporter extract --config <absolute-config-path>
 ```
+
+`code-tree-exporter --config <absolute-config-path>` vẫn được giữ để tương thích V2.
+Kiểm tra một CSV lạ bằng `code-tree-exporter catalog inspect <csv-path>` trước
+khi viết profile.
 
 Chạy trực tiếp từ source:
 
@@ -135,6 +179,11 @@ code-tree-query --output <dist> explain-node --node-id <node-id>
 code-tree-query --output <dist> open-source --evidence-id <evidence-id>
 code-tree-query --output <dist> list-issues --source order-api
 code-tree-query --output <dist> search-memory --text orders
+code-tree-query --output <dist> catalog-status
+code-tree-query --output <dist> health
+code-tree-query --output <dist> unresolved
+code-tree-query --output <dist> input-output --node-id <node-id>
+code-tree-query --output <dist> trace-flow --node-id <node-id>
 ```
 
 Chạy trực tiếp từ source bằng
@@ -157,6 +206,8 @@ dist/
 ├── manifest.json
 ├── graph-index.json
 ├── graph.sqlite
+├── quality-report.json
+├── QUALITY_REPORT.md
 ├── codebase-memory/
 │   ├── entities/*.jsonl
 │   ├── relationships/*.jsonl

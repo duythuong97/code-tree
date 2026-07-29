@@ -37,6 +37,8 @@ var builder = new PackageBuilder(
         ["source"] = source,
         ["technology"] = "C# Roslyn Workspace/SemanticModel",
         ["parser"] = "Microsoft.CodeAnalysis.CSharp",
+        ["extractorContract"] = "3.0",
+        ["capabilities"] = new[] { "batch-input-output", "command-mode-lineage", "database-lineage", "semantic-summary" },
     });
 builder.FilesScanned = files.Count;
 

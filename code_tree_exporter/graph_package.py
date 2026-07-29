@@ -502,7 +502,7 @@ class GraphPackage:
         *,
         source_name: str,
         config_path: str,
-        extractor_version: str = "0.4.0",
+        extractor_version: str = "3.0.0",
         output_mode: str = "flat",
         knowledge_chunking: dict[str, object] | None = None,
         max_evidence_snippet_chars: int = 500,

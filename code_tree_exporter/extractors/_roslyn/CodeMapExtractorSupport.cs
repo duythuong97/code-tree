@@ -749,7 +749,9 @@ public sealed class Catalog
             var table = ExtractorRuntime.OracleIdentifier(row["table_code"]);
             if (!catalog._tables.TryGetValue(db, out var tables)) catalog._tables[db] = tables = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
             if (!tables.TryGetValue(table, out var columns)) tables[table] = columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var child = Path.Combine(inputRoot, "tables", row["table_code"] + ".csv");
+            var child = row.TryGetValue("columns_file", out var configured) && !string.IsNullOrWhiteSpace(configured)
+                ? Path.Combine(inputRoot, configured.Replace('/', Path.DirectorySeparatorChar))
+                : Path.Combine(inputRoot, "tables", row["table_code"] + ".csv");
             if (File.Exists(child))
                 foreach (var columnRow in Csv.Read(child)) columns.Add(ExtractorRuntime.OracleIdentifier(columnRow["column_code"]));
         }

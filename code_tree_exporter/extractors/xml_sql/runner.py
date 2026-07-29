@@ -36,11 +36,17 @@ def extract(config: dict) -> None:
         f"xml-sql-{source}",
         f"extractor:xml-sql/{source}",
         "xml-sql-extractor",
-        "1.0.0",
+        "3.0.0",
         {
             "source": source,
             "repository": repository,
             "technology": "Python ElementTree and Oracle SQL analyzer",
+            "extractorContract": "3.0",
+            "capabilities": [
+                "mapper-input-output",
+                "fragment-resolution",
+                "database-lineage",
+            ],
         },
     )
     builder.files_scanned = len(files)
@@ -222,6 +228,4 @@ def extract(config: dict) -> None:
                 properties, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             )
     builder.write(Path(config["output"]))
-
-
 

@@ -88,6 +88,8 @@ function extract(ts, config) {
     tsconfig: discovery.tsconfigPath ? repoPath(path.relative(discovery.root, discovery.tsconfigPath)) : '',
     folders: discovery.folders,
     exclusions: discovery.exclusions,
+    extractorContract: '3.0',
+    capabilities: ['route-input-output', 'api-client-lineage', 'semantic-summary'],
   });
   builder.filesScanned = files.length;
 
