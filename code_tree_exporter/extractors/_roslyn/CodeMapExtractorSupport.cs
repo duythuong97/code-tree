@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -34,8 +35,90 @@ public sealed record InvocationInfo(string SourceClass, string SourceMember, str
 public sealed record MethodInvocationInfo(string SourceClass, string SourceMember, string TargetClass, string TargetMember, int Start, SourceFile File, string SourceIdentity = "", string TargetIdentity = "", string SourceClassIdentity = "", string TargetClassIdentity = "");
 sealed record StringEvaluation(string Value, bool IsDynamic);
 
+public sealed class CompilationIndex
+{
+    readonly Compilation _compilation;
+    readonly Dictionary<SyntaxTree, SemanticModel> _semanticModels = new();
+    readonly Lazy<IReadOnlyList<INamedTypeSymbol>> _declaredTypes;
+    readonly Lazy<HashSet<string>> _visibleTypeNames;
+    readonly Lazy<HashSet<string>> _visibleClassNames;
+    readonly Dictionary<ISymbol, IReadOnlyList<IMethodSymbol>> _interfaceImplementations = new(SymbolEqualityComparer.Default);
+
+    public CompilationIndex(Compilation compilation)
+    {
+        _compilation = compilation;
+        _declaredTypes = new Lazy<IReadOnlyList<INamedTypeSymbol>>(LoadDeclaredTypes);
+        _visibleTypeNames = new Lazy<HashSet<string>>(() => DeclaredTypes.Select(type => type.Name).ToHashSet(StringComparer.Ordinal));
+        _visibleClassNames = new Lazy<HashSet<string>>(() => DeclaredTypes.Where(type => type.TypeKind == TypeKind.Class).Select(type => type.Name).ToHashSet(StringComparer.Ordinal));
+    }
+
+    public IReadOnlyList<INamedTypeSymbol> DeclaredTypes => _declaredTypes.Value;
+
+    public HashSet<string> VisibleTypeNames()
+        => _visibleTypeNames.Value;
+
+    public HashSet<string> VisibleClassNames()
+        => _visibleClassNames.Value;
+
+    public SemanticModel SemanticModel(SyntaxTree tree)
+    {
+        if (!_semanticModels.TryGetValue(tree, out var model))
+        {
+            model = _compilation.GetSemanticModel(tree);
+            _semanticModels[tree] = model;
+        }
+        return model;
+    }
+
+    public IReadOnlyList<IMethodSymbol> InterfaceImplementations(IMethodSymbol symbol)
+    {
+        if (symbol.ContainingType.TypeKind != TypeKind.Interface)
+            return Array.Empty<IMethodSymbol>();
+        if (_interfaceImplementations.TryGetValue(symbol, out var cached))
+            return cached;
+        var implementations = DeclaredTypes
+            .Where(type => type.TypeKind != TypeKind.Interface
+                && type.AllInterfaces.Any(contract => SymbolEqualityComparer.Default.Equals(contract, symbol.ContainingType)))
+            .Select(type => type.FindImplementationForInterfaceMember(symbol))
+            .OfType<IMethodSymbol>()
+            .Distinct<ISymbol>(SymbolEqualityComparer.Default)
+            .OfType<IMethodSymbol>()
+            .ToArray();
+        _interfaceImplementations[symbol] = implementations;
+        return implementations;
+    }
+
+    IReadOnlyList<INamedTypeSymbol> LoadDeclaredTypes()
+    {
+        var result = new List<INamedTypeSymbol>();
+        var seen = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        foreach (var tree in _compilation.SyntaxTrees)
+        {
+            var model = SemanticModel(tree);
+            foreach (var declaration in tree.GetRoot().DescendantNodes().OfType<TypeDeclarationSyntax>())
+            {
+                if (model.GetDeclaredSymbol(declaration) is INamedTypeSymbol symbol && seen.Add(symbol))
+                    result.Add(symbol);
+            }
+        }
+        foreach (var reference in _compilation.References.OfType<CompilationReference>())
+        {
+            foreach (var symbol in ExtractorRuntime.CompilationIndex(reference.Compilation).DeclaredTypes)
+            {
+                if (seen.Add(symbol)) result.Add(symbol);
+            }
+        }
+        return result;
+    }
+}
+
 public static class ExtractorRuntime
 {
+    static readonly ConditionalWeakTable<Compilation, CompilationIndex> CompilationIndexes = new();
+
+    public static CompilationIndex CompilationIndex(Compilation compilation)
+        => CompilationIndexes.GetValue(compilation, value => new CompilationIndex(value));
+
     public static JsonDocument LoadConfig(string path)
     {
         if (!Path.IsPathFullyQualified(path)) throw new ArgumentException($"Config path must be absolute: {path}");
@@ -64,6 +147,21 @@ public static class ExtractorRuntime
     public static List<SourceFile> ConfiguredFiles(JsonElement config, IReadOnlyCollection<string> extensions)
     {
         var root = ConfigPath(config, "root");
+        return ConfiguredPaths(config, extensions)
+            .Select(path =>
+            {
+                var text = File.ReadAllText(path, Encoding.UTF8);
+                var syntaxTree = Path.GetExtension(path).Equals(".cs", StringComparison.OrdinalIgnoreCase)
+                    ? CSharpSyntaxTree.ParseText(text, path: path)
+                    : null;
+                return new SourceFile(path, RepositoryPath(Path.GetRelativePath(root, path)), text, syntaxTree);
+            })
+            .ToList();
+    }
+
+    public static List<string> ConfiguredPaths(JsonElement config, IReadOnlyCollection<string> extensions)
+    {
+        var root = ConfigPath(config, "root");
         var selections = new List<string>();
         if (config.TryGetProperty("files", out var filesElement) && filesElement.ValueKind == JsonValueKind.Array)
         {
@@ -80,7 +178,7 @@ public static class ExtractorRuntime
         }
         if (selections.Count == 0) selections.Add(".");
 
-        var files = new List<SourceFile>();
+        var files = new List<string>();
         var seen = new HashSet<string>(PathComparer);
         foreach (var selection in selections)
         {
@@ -97,11 +195,7 @@ public static class ExtractorRuntime
                 if (!seen.Add(path)) continue;
                 if (IsExcludedSourcePath(path, root)) continue;
                 if (!extensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase)) continue;
-                var text = File.ReadAllText(path, Encoding.UTF8);
-                var syntaxTree = Path.GetExtension(path).Equals(".cs", StringComparison.OrdinalIgnoreCase)
-                    ? CSharpSyntaxTree.ParseText(text, path: path)
-                    : null;
-                files.Add(new SourceFile(path, RepositoryPath(Path.GetRelativePath(root, path)), text, syntaxTree));
+                files.Add(Path.GetFullPath(path));
             }
         }
         return files;
@@ -118,7 +212,7 @@ public static class ExtractorRuntime
         return relative != ".." && !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) && !Path.IsPathRooted(relative);
     }
 
-    static bool IsExcludedSourcePath(string path, string root)
+    public static bool IsExcludedSourcePath(string path, string root)
     {
         var relative = RepositoryPath(Path.GetRelativePath(root, path));
         var parts = relative.Split('/', StringSplitOptions.RemoveEmptyEntries);
@@ -276,7 +370,8 @@ public static class ExtractorRuntime
             var targets = implementations.Count > 0 ? implementations : new[] { symbol };
             foreach (var targetSymbol in targets)
             {
-                var targetClass = classes.FirstOrDefault(name => name.Equals(targetSymbol.ContainingType?.Name, StringComparison.Ordinal));
+                var targetName = targetSymbol.ContainingType?.Name ?? string.Empty;
+                var targetClass = classes.Contains(targetName) ? targetName : string.Empty;
                 if (string.IsNullOrEmpty(targetClass)) continue;
                 var sourceDeclaration = invocation.AncestorsAndSelf().OfType<MethodDeclarationSyntax>().FirstOrDefault();
                 var sourceIdentity = sourceDeclaration is null ? string.Empty : DeclarationIdentity(sourceDeclaration.SyntaxTree, sourceDeclaration.SpanStart);
@@ -563,7 +658,7 @@ public static class ExtractorRuntime
            ?? string.Empty;
 
     static string MatchKnownClass(string typeName, IReadOnlyCollection<string> knownClasses)
-        => knownClasses.FirstOrDefault(name => name.Equals(typeName, StringComparison.Ordinal)) ?? string.Empty;
+        => knownClasses.Contains(typeName) ? typeName : string.Empty;
 
     static IMethodSymbol? InvocationMethodSymbol(InvocationExpressionSyntax invocation, SemanticModel model)
     {
@@ -576,15 +671,9 @@ public static class ExtractorRuntime
     static IReadOnlyList<IMethodSymbol> InterfaceImplementations(IMethodSymbol symbol, Compilation compilation, IReadOnlyCollection<string> knownClasses)
     {
         if (symbol.ContainingType.TypeKind != TypeKind.Interface) return Array.Empty<IMethodSymbol>();
-        return compilation.SyntaxTrees
-            .SelectMany(tree => tree.GetRoot().DescendantNodes().OfType<TypeDeclarationSyntax>())
-            .Select(type => compilation.GetSemanticModel(type.SyntaxTree).GetDeclaredSymbol(type))
-            .OfType<INamedTypeSymbol>()
-            .Where(type => knownClasses.Contains(type.Name) && type.AllInterfaces.Any(contract => SymbolEqualityComparer.Default.Equals(contract, symbol.ContainingType)))
-            .Select(type => type.FindImplementationForInterfaceMember(symbol))
-            .OfType<IMethodSymbol>()
-            .Distinct<ISymbol>(SymbolEqualityComparer.Default)
-            .OfType<IMethodSymbol>()
+        return CompilationIndex(compilation)
+            .InterfaceImplementations(symbol)
+            .Where(implementation => knownClasses.Contains(implementation.ContainingType.Name))
             .ToArray();
     }
 
@@ -668,8 +757,13 @@ public static class ExtractorRuntime
 
     public static string LineText(SourceFile file, int line)
     {
-        var lines = file.Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-        return line >= 1 && line <= lines.Length ? lines[line - 1] : string.Empty;
+        if (file.SyntaxTree is not null)
+        {
+            var lines = file.SyntaxTree.GetText().Lines;
+            return line >= 1 && line <= lines.Count ? lines[line - 1].ToString() : string.Empty;
+        }
+        var textLines = file.Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+        return line >= 1 && line <= textLines.Length ? textLines[line - 1] : string.Empty;
     }
 
     public static int LineContaining(string text, string needle)

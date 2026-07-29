@@ -30,6 +30,12 @@ query CLI.
 - `flow_io`: I/O items participating in a materialized flow.
 - `quality_metrics`: global and per-source extraction metrics.
 
+The extraction step publishes the database, root manifest, graph index, and
+JSONL codebase memory only. It does not publish Markdown. The `metadata` table
+stores `output_mode`, `markdown_options`, and `source_descriptors` so
+`code-tree-export-markdown` can recreate all Markdown projections without
+reading the original source tree or extractor config.
+
 All graph tables include `package_key`; logical source partitions therefore
 remain queryable without duplicating graph files. `properties_json` is a JSON
 object. References inside known JSON values are rewritten to compact integer ID
@@ -87,3 +93,5 @@ with the final `graph.sqlite` checksum, are published in `manifest.json`.
 
 Extractor subprocesses may still exchange temporary CSV package files with the
 pipeline. Those files are internal staging data and are not published output.
+Markdown is a separate derived artifact produced from `graph.sqlite` by
+`code-tree-export-markdown` (or `python -m code_tree_exporter.markdown_export`).

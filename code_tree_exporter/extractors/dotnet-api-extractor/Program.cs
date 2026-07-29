@@ -1,7 +1,6 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using CodeMap.Extractors;
-using Microsoft.Build.Construction;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -21,7 +20,8 @@ var output = ExtractorRuntime.ConfigPath(config, "output");
 var inputRoot = ExtractorRuntime.ConfigPath(config, "inputData");
 var catalog = Catalog.Load(inputRoot, database);
 var mapperQueries = StringArray(config, "xmlMapperQueries").ToHashSet(StringComparer.Ordinal);
-var files = ExpandWorkspaceFiles(ExtractorRuntime.ConfiguredFiles(config, new[] { ".cs", ".csproj", ".sln" }), root);
+var workspaceSnapshot = await DotNetWorkspaceLoader.LoadAsync(config, root);
+var files = workspaceSnapshot.Files;
 var csFiles = files.Where(file => file.SyntaxTree is not null).ToList();
 
 var builder = new PackageBuilder(
@@ -36,30 +36,21 @@ var builder = new PackageBuilder(
         ["parser"] = "Microsoft.CodeAnalysis.CSharp",
         ["extractorContract"] = "3.0",
         ["capabilities"] = new[] { "endpoint-input-output", "di-resolution", "database-lineage", "semantic-summary" },
+        ["workspace"] = "MSBuildWorkspace",
+        ["workspaceProjectCount"] = workspaceSnapshot.LoadedProjectCount,
+        ["fallbackFileCount"] = workspaceSnapshot.FallbackFileCount,
     });
 builder.FilesScanned = files.Count;
+
+AddWorkspaceIssues(builder, workspaceSnapshot, csFiles);
 
 var appId = ExtractorRuntime.StableNodeId("api-application", application);
 builder.AddNode(appId, "API_APPLICATION", application, application, application, systemKey, database, repository);
 AddConfigurationNodes(builder, appId, root, repository, systemKey, database);
 var solutions = DiscoverSolutions(files, root, repository);
-var projects = DiscoverProjects(files, csFiles, root, database, repository);
+var projects = DiscoverProjects(files, csFiles, workspaceSnapshot.Projects, root, database, repository);
 var projectsById = projects.ToDictionary(project => project.Id, StringComparer.Ordinal);
-var compilationByTree = CreateProjectCompilations(csFiles, projects);
-var semanticErrorCount = compilationByTree.Values
-    .Distinct()
-    .SelectMany(compilation => compilation.GetDiagnostics())
-    .Count(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error);
-if (semanticErrorCount > 0)
-    builder.AddIssue(
-        "SEMANTIC_TREE_UNAVAILABLE",
-        "WARNING",
-        $"Roslyn compilation has {semanticErrorCount} error(s); syntax facts are retained and unresolved semantic links are degraded",
-        properties: new Dictionary<string, object>
-        {
-            ["semanticErrorCount"] = semanticErrorCount,
-            ["mode"] = OperatingSystem.IsWindows() ? "windows-best-effort" : "portable-best-effort",
-        });
+var compilationByTree = workspaceSnapshot.CompilationByTree;
 foreach (var solution in solutions)
     builder.AddNode(solution.Id, "DOTNET_SOLUTION", Path.GetFileName(solution.RelativePath), $"{repository}/{solution.RelativePath}", DisplaySolutionName(solution), systemKey, "", repository, "TECHNICAL", properties: new Dictionary<string, object> { ["path"] = solution.RelativePath });
 foreach (var project in projects)
@@ -76,7 +67,7 @@ var classIdentityByDeclaration = new Dictionary<string, string>(StringComparer.O
 var classIdentityByMemberDeclaration = new Dictionary<string, string>(StringComparer.Ordinal);
 foreach (var file in csFiles)
 {
-    var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
+    var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
     foreach (var type in ExtractorRuntime.Types(file))
     {
         var project = ProjectForFile(file, projects);
@@ -92,7 +83,7 @@ foreach (var file in csFiles)
 var endpoints = new List<EndpointInfo>();
 foreach (var file in csFiles)
 {
-    var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
+    var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
     endpoints.AddRange(ExtractorRuntime.Endpoints(file, model));
     endpoints.AddRange(NetFrameworkSupport.ExtractRouteConfig(file, model));
 }
@@ -100,11 +91,8 @@ foreach (var file in csFiles)
 var invocationEdges = new List<InvocationInfo>();
 foreach (var file in csFiles)
 {
-    var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
-    var visibleClassNames = model.Compilation.SyntaxTrees
-        .SelectMany(tree => tree.GetRoot().DescendantNodes().OfType<TypeDeclarationSyntax>())
-        .Select(type => type.Identifier.Text)
-        .ToHashSet(StringComparer.Ordinal);
+    var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
+    var visibleClassNames = ExtractorRuntime.CompilationIndex(model.Compilation).VisibleTypeNames();
     invocationEdges.AddRange(ExtractorRuntime.InvocationEdges(file, model, visibleClassNames));
 }
 var mapperReferences = FindMapperReferences(csFiles, compilationByTree, projects, mapperQueries);
@@ -112,7 +100,7 @@ var mapperReferences = FindMapperReferences(csFiles, compilationByTree, projects
 var dataAccessClasses = mapperReferences.Select(reference => reference.OwnerClass).ToHashSet(StringComparer.Ordinal);
 foreach (var file in csFiles)
 {
-    var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
+    var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
     foreach (var expression in ExtractorRuntime.StringExpressions(file, model))
     {
         if (string.IsNullOrEmpty(expression.OwnerClassIdentity)) continue;
@@ -176,7 +164,7 @@ var methodNodeIdsByDeclaration = new Dictionary<(SyntaxTree Tree, int Start), st
 var methodNodeIdsByIdentity = new Dictionary<string, string>(StringComparer.Ordinal);
 foreach (var file in csFiles)
 {
-    var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
+    var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
     foreach (var method in file.SyntaxTree!.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>())
     {
         var methodSymbol = model.GetDeclaredSymbol(method);
@@ -251,7 +239,7 @@ foreach (var invocation in invocationEdges)
 
 foreach (var file in csFiles)
 {
-    var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
+    var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
     foreach (var expression in ExtractorRuntime.StringExpressions(file, model))
     {
         var ownerId = SourceMethodNodeId(file, expression.Start, methodNodeIdsByDeclaration);
@@ -329,39 +317,31 @@ static string? SourceMethodNodeId(SourceFile file, int offset, IReadOnlyDictiona
 static string? TargetMethodNodeId(InvocationInfo invocation, IReadOnlyDictionary<string, string> methodNodeIds)
     => methodNodeIds.GetValueOrDefault(invocation.TargetIdentity);
 
+static SemanticModel SemanticModelFor(IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilations, SyntaxTree tree)
+    => ExtractorRuntime.CompilationIndex(compilations[tree]).SemanticModel(tree);
+
 static void AddInterfaceImplementationEdges(PackageBuilder builder, IEnumerable<SourceFile> files, IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilations, IReadOnlyDictionary<(SyntaxTree Tree, int Start), string> methodNodeIds)
 {
     foreach (var file in files.Where(file => file.SyntaxTree is not null))
     {
-        var compilation = compilations[file.SyntaxTree!];
-        var model = compilation.GetSemanticModel(file.SyntaxTree!);
-        foreach (var declaration in file.SyntaxTree!.GetRoot().DescendantNodes().OfType<InterfaceDeclarationSyntax>())
+        var model = SemanticModelFor(compilations, file.SyntaxTree!);
+        foreach (var declaration in file.SyntaxTree!.GetRoot().DescendantNodes().OfType<TypeDeclarationSyntax>())
         {
-            var contract = model.GetDeclaredSymbol(declaration);
-            if (contract is null) continue;
-            var implementations = compilation.SyntaxTrees
-                .SelectMany(tree => tree.GetRoot().DescendantNodes().OfType<TypeDeclarationSyntax>())
-                .Select(type => compilation.GetSemanticModel(type.SyntaxTree).GetDeclaredSymbol(type))
-                .OfType<INamedTypeSymbol>()
-                .Where(type => type.TypeKind != TypeKind.Interface && type.AllInterfaces.Any(item => SymbolEqualityComparer.Default.Equals(item, contract)))
-                .ToList();
-            foreach (var member in contract.GetMembers().OfType<IMethodSymbol>())
+            var implementationType = model.GetDeclaredSymbol(declaration);
+            if (implementationType is null || implementationType.TypeKind == TypeKind.Interface) continue;
+            foreach (var contract in implementationType.AllInterfaces)
             {
-                var sourceId = member.DeclaringSyntaxReferences
-                    .Select(reference => methodNodeIds.GetValueOrDefault((reference.SyntaxTree, reference.Span.Start)))
-                    .FirstOrDefault(id => !string.IsNullOrEmpty(id));
-                if (string.IsNullOrEmpty(sourceId)) continue;
-                var targets = implementations
-                    .Select(type => type.FindImplementationForInterfaceMember(member))
-                    .OfType<IMethodSymbol>()
-                    .SelectMany(symbol => symbol.DeclaringSyntaxReferences)
-                    .Select(reference => methodNodeIds.GetValueOrDefault((reference.SyntaxTree, reference.Span.Start)))
-                    .Where(id => !string.IsNullOrEmpty(id))
-                    .Distinct(StringComparer.Ordinal)
-                    .Cast<string>()
-                    .ToList();
-                foreach (var targetId in targets)
-                    builder.AddEdge(sourceId, targetId, "RESOLVES_TO", confidence: targets.Count == 1 ? 1.0 : 0.5, properties: new Dictionary<string, object> { ["dispatch"] = "interface", ["candidate_count"] = targets.Count });
+                foreach (var member in contract.GetMembers().OfType<IMethodSymbol>())
+                {
+                    var sourceId = member.DeclaringSyntaxReferences
+                        .Select(reference => methodNodeIds.GetValueOrDefault((reference.SyntaxTree, reference.Span.Start)))
+                        .FirstOrDefault(id => !string.IsNullOrEmpty(id));
+                    var targetId = implementationType.FindImplementationForInterfaceMember(member)?.DeclaringSyntaxReferences
+                        .Select(reference => methodNodeIds.GetValueOrDefault((reference.SyntaxTree, reference.Span.Start)))
+                        .FirstOrDefault(id => !string.IsNullOrEmpty(id));
+                    if (!string.IsNullOrEmpty(sourceId) && !string.IsNullOrEmpty(targetId))
+                        builder.AddEdge(sourceId, targetId, "RESOLVES_TO", confidence: 1.0, properties: new Dictionary<string, object> { ["dispatch"] = "interface", ["candidate_count"] = 1 });
+                }
             }
         }
     }
@@ -371,7 +351,7 @@ static void AddTypeReferenceEdges(PackageBuilder builder, IEnumerable<SourceFile
 {
     foreach (var file in files.Where(file => file.SyntaxTree is not null))
     {
-        var model = compilations[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
+        var model = SemanticModelFor(compilations, file.SyntaxTree!);
         foreach (var syntax in file.SyntaxTree!.GetRoot().DescendantNodes().OfType<TypeSyntax>())
         {
             var symbol = model.GetTypeInfo(syntax).Type as INamedTypeSymbol;
@@ -402,7 +382,7 @@ static List<MapperReference> FindMapperReferences(IEnumerable<SourceFile> files,
     if (knownQueries.Count == 0) return result;
     foreach (var file in files.Where(file => file.SyntaxTree is not null))
     {
-        var model = compilations[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
+        var model = SemanticModelFor(compilations, file.SyntaxTree!);
         foreach (var invocation in file.SyntaxTree!.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
         {
             var argument = invocation.ArgumentList.Arguments.FirstOrDefault()?.Expression;
@@ -452,7 +432,7 @@ static void AttachApiSemanticTrees(PackageBuilder builder, IEnumerable<EndpointI
             };
             if (body is null && handlerExpression is not null)
             {
-                var handlerSymbol = compilation.GetSemanticModel(file.SyntaxTree).GetSymbolInfo(handlerExpression).Symbol as IMethodSymbol;
+                var handlerSymbol = ExtractorRuntime.CompilationIndex(compilation).SemanticModel(file.SyntaxTree).GetSymbolInfo(handlerExpression).Symbol as IMethodSymbol;
                 var declaration = handlerSymbol?.DeclaringSyntaxReferences.Select(reference => reference.GetSyntax()).OfType<MethodDeclarationSyntax>().FirstOrDefault();
                 if (declaration is not null && filesByTree.TryGetValue(declaration.SyntaxTree, out var declarationFile))
                 {
@@ -467,7 +447,7 @@ static void AttachApiSemanticTrees(PackageBuilder builder, IEnumerable<EndpointI
             }
         }
         if (body is null) continue;
-        var model = compilation.GetSemanticModel(semanticFile.SyntaxTree!);
+        var model = SemanticModelFor(compilationByTree, semanticFile.SyntaxTree!);
         SemanticCallResolution? ResolveCall(InvocationExpressionSyntax invocation)
         {
             var info = model.GetSymbolInfo(invocation);
@@ -497,7 +477,7 @@ static void AttachMethodSemanticTrees(PackageBuilder builder, IEnumerable<Source
 {
     SemanticCallResolution? ResolveCall(InvocationExpressionSyntax invocation)
     {
-        var model = compilationByTree[invocation.SyntaxTree].GetSemanticModel(invocation.SyntaxTree);
+        var model = SemanticModelFor(compilationByTree, invocation.SyntaxTree);
         var info = model.GetSymbolInfo(invocation);
         var symbols = info.Symbol is IMethodSymbol symbol ? new[] { symbol } : info.CandidateSymbols.OfType<IMethodSymbol>().ToArray();
         var ids = symbols.SelectMany(candidate => candidate.DeclaringSyntaxReferences)
@@ -588,78 +568,50 @@ static string SourceWindow(string text, int center, int radius)
     return text[start..end];
 }
 
-static List<SourceFile> ExpandWorkspaceFiles(List<SourceFile> seedFiles, string root)
+static void AddWorkspaceIssues(PackageBuilder builder, DotNetWorkspaceSnapshot snapshot, IReadOnlyCollection<SourceFile> csFiles)
 {
-    var byPath = new Dictionary<string, SourceFile>(StringComparer.OrdinalIgnoreCase);
-    var projectQueue = new Queue<string>();
-    var queuedProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-    foreach (var file in seedFiles)
+    var syntaxErrorCount = csFiles.Sum(file => file.SyntaxTree!.GetDiagnostics().Count(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+    if (syntaxErrorCount > 0)
     {
-        AddSourceFile(byPath, file);
-        if (Path.GetExtension(file.AbsolutePath).Equals(".csproj", StringComparison.OrdinalIgnoreCase) && queuedProjects.Add(file.AbsolutePath))
-            projectQueue.Enqueue(file.AbsolutePath);
-        if (Path.GetExtension(file.AbsolutePath).Equals(".sln", StringComparison.OrdinalIgnoreCase))
-        {
-            foreach (var projectPath in SolutionProjectPaths(file.AbsolutePath))
-                if (queuedProjects.Add(projectPath)) projectQueue.Enqueue(projectPath);
-        }
+        builder.AddIssue(
+            "CSHARP_PARSE_ERROR",
+            "WARNING",
+            $"Roslyn found {syntaxErrorCount} C# syntax error(s); valid syntax and available semantic links are retained",
+            properties: new Dictionary<string, object> { ["syntaxErrorCount"] = syntaxErrorCount });
     }
-
-    while (projectQueue.Count > 0)
+    if (snapshot.Diagnostics.Count > 0)
     {
-        var projectPath = projectQueue.Dequeue();
-        if (!ExtractorRuntime.IsWithin(projectPath, root) || !File.Exists(projectPath)) continue;
-        var projectFile = ReadSourceFile(projectPath, root);
-        AddSourceFile(byPath, projectFile);
-        var projectDirectory = Path.GetDirectoryName(projectPath) ?? root;
-        foreach (var sourcePath in Directory.Exists(projectDirectory)
-            ? Directory.EnumerateFiles(projectDirectory, "*.cs", SearchOption.AllDirectories).Where(path => !IsExcludedProjectPath(path)).OrderBy(path => path, StringComparer.Ordinal)
-            : Enumerable.Empty<string>())
-            AddSourceFile(byPath, ReadSourceFile(sourcePath, root));
-        foreach (var includePath in ProjectIncludePaths(projectFile.Text, projectDirectory, "Compile").Where(path => File.Exists(path)))
-            AddSourceFile(byPath, ReadSourceFile(includePath, root));
-        foreach (var referencePath in ProjectIncludePaths(projectFile.Text, projectDirectory, "ProjectReference").Where(path => File.Exists(path)))
-        {
-            AddSourceFile(byPath, ReadSourceFile(referencePath, root));
-            if (queuedProjects.Add(referencePath)) projectQueue.Enqueue(referencePath);
-        }
+        builder.AddIssue(
+            "MSBUILD_WORKSPACE_DIAGNOSTIC",
+            "WARNING",
+            $"MSBuildWorkspace reported {snapshot.Diagnostics.Count} load diagnostic(s); affected projects use best-effort extraction",
+            properties: new Dictionary<string, object>
+            {
+                ["diagnosticCount"] = snapshot.Diagnostics.Count,
+                ["samples"] = snapshot.Diagnostics.Take(10).ToArray(),
+            });
     }
-
-    return byPath.Values.OrderBy(file => file.AbsolutePath, StringComparer.Ordinal).ToList();
-}
-
-static void AddSourceFile(Dictionary<string, SourceFile> byPath, SourceFile file)
-{
-    if (!IsExcludedProjectPath(file.AbsolutePath)) byPath.TryAdd(file.AbsolutePath, file);
-}
-
-static SourceFile ReadSourceFile(string absolutePath, string root)
-{
-    var path = Path.GetFullPath(absolutePath);
-    var text = File.ReadAllText(path);
-    var syntaxTree = Path.GetExtension(path).Equals(".cs", StringComparison.OrdinalIgnoreCase)
-        ? CSharpSyntaxTree.ParseText(text, path: path)
-        : null;
-    return new SourceFile(path, SourceRelativePath(path, root), text, syntaxTree);
-}
-
-static string SourceRelativePath(string absolutePath, string root)
-{
-    return ExtractorRuntime.RepositoryPath(Path.GetRelativePath(root, absolutePath));
-}
-
-static bool IsExcludedProjectPath(string path)
-{
-    var parts = path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
-    return parts.Any(part => part.Equals("bin", StringComparison.OrdinalIgnoreCase) || part.Equals("obj", StringComparison.OrdinalIgnoreCase));
+    if (snapshot.FallbackFileCount > 0)
+    {
+        builder.AddIssue(
+            "MSBUILD_WORKSPACE_FALLBACK",
+            "WARNING",
+            $"{snapshot.FallbackFileCount} C# file(s) were not loaded by a project and use a fallback compilation",
+            properties: new Dictionary<string, object> { ["fallbackFileCount"] = snapshot.FallbackFileCount });
+    }
 }
 
 static IEnumerable<string> SolutionProjectPaths(string solutionPath)
 {
     var directory = Path.GetDirectoryName(solutionPath) ?? Directory.GetCurrentDirectory();
-    foreach (var project in SolutionFile.Parse(solutionPath).ProjectsInOrder.Where(project => Path.GetExtension(project.RelativePath).Equals(".csproj", StringComparison.OrdinalIgnoreCase)))
-        yield return Path.GetFullPath(Path.Combine(directory, ProjectPath(project.RelativePath)));
+    string text;
+    try { text = File.ReadAllText(solutionPath); }
+    catch { yield break; }
+    foreach (Match match in Regex.Matches(
+        text,
+        "Project\\([^)]*\\)\\s*=\\s*\"[^\"\\r\\n]+\"\\s*,\\s*\"(?<path>[^\"\\r\\n]+\\.csproj)\"",
+        RegexOptions.IgnoreCase))
+        yield return Path.GetFullPath(Path.Combine(directory, ProjectPath(match.Groups["path"].Value)));
 }
 
 static IEnumerable<string> ProjectIncludePaths(string text, string directory, string itemName)
@@ -685,20 +637,26 @@ static List<SolutionInfo> DiscoverSolutions(List<SourceFile> files, string root,
         .ToList();
 }
 
-static List<ProjectInfo> DiscoverProjects(List<SourceFile> files, List<SourceFile> csFiles, string root, string database, string repository)
+static List<ProjectInfo> DiscoverProjects(List<SourceFile> files, List<SourceFile> csFiles, IReadOnlyList<WorkspaceProjectInfo> workspaceProjects, string root, string database, string repository)
 {
     var projects = new List<ProjectInfo>();
+    var workspaceByPath = workspaceProjects.ToDictionary(project => project.FilePath, ExtractorRuntime.PathComparer);
     foreach (var file in files.Where(file => Path.GetExtension(file.AbsolutePath).Equals(".csproj", StringComparison.OrdinalIgnoreCase)).OrderBy(file => file.AbsolutePath, StringComparer.Ordinal))
     {
         var relativePath = ExtractorRuntime.RepositoryPath(Path.GetRelativePath(root, file.AbsolutePath));
         var directory = Path.GetDirectoryName(file.AbsolutePath) ?? root;
-        var projectFiles = csFiles.Where(source => IsUnderDirectory(source.AbsolutePath, directory)).ToList();
+        workspaceByPath.TryGetValue(file.AbsolutePath, out var workspaceProject);
+        var sourcePaths = workspaceProject is null
+            ? csFiles.Where(source => IsUnderDirectory(source.AbsolutePath, directory)).Select(source => source.AbsolutePath).ToHashSet(ExtractorRuntime.PathComparer)
+            : workspaceProject.DocumentPaths.ToHashSet(ExtractorRuntime.PathComparer);
+        var referencePaths = workspaceProject?.ProjectReferencePaths
+            ?? ProjectIncludePaths(file.Text, directory, "ProjectReference").ToList();
         projects.Add(new ProjectInfo(
             ExtractorRuntime.StableNodeId("dotnet-project", repository, relativePath),
             relativePath,
             directory,
-            projectFiles,
-            ProjectReferenceIds(file.Text, directory, root, repository)));
+            sourcePaths,
+            ProjectReferenceIds(referencePaths, root, repository)));
     }
     return projects;
 }
@@ -711,9 +669,9 @@ static IEnumerable<string> SolutionProjectIds(SolutionInfo solution, List<Projec
         .Select(path => ExtractorRuntime.StableNodeId("dotnet-project", repository, path));
 }
 
-static List<string> ProjectReferenceIds(string text, string directory, string root, string repository)
+static List<string> ProjectReferenceIds(IEnumerable<string> paths, string root, string repository)
 {
-    return ProjectIncludePaths(text, directory, "ProjectReference")
+    return paths
         .Where(path => ExtractorRuntime.IsWithin(path, root))
         .Select(path => ExtractorRuntime.RepositoryPath(Path.GetRelativePath(root, path)))
         .Select(path => ExtractorRuntime.StableNodeId("dotnet-project", repository, path))
@@ -726,40 +684,13 @@ static string ProjectPath(string value)
 static ProjectInfo? ProjectForFile(SourceFile file, List<ProjectInfo> projects)
 {
     return projects
+        .Where(project => project.SourcePaths.Contains(file.AbsolutePath))
+        .OrderByDescending(project => project.Directory.Length)
+        .FirstOrDefault()
+        ?? projects
         .Where(project => IsUnderDirectory(file.AbsolutePath, project.Directory))
         .OrderByDescending(project => project.Directory.Length)
         .FirstOrDefault();
-}
-
-static Dictionary<SyntaxTree, CSharpCompilation> CreateProjectCompilations(List<SourceFile> csFiles, List<ProjectInfo> projects)
-{
-    var ownerByTree = csFiles.ToDictionary(file => file.SyntaxTree!, file => ProjectForFile(file, projects));
-    var filesByProject = projects.ToDictionary(
-        project => project.Id,
-        project => csFiles.Where(file => ownerByTree[file.SyntaxTree!]?.Id == project.Id).ToList(),
-        StringComparer.Ordinal);
-    var projectsById = projects.ToDictionary(project => project.Id, StringComparer.Ordinal);
-    var result = new Dictionary<SyntaxTree, CSharpCompilation>();
-    foreach (var project in projects)
-    {
-        var projectIds = new HashSet<string>(StringComparer.Ordinal) { project.Id };
-        var pending = new Queue<string>(project.ProjectReferences);
-        while (pending.TryDequeue(out var projectId))
-        {
-            if (!projectIds.Add(projectId) || !projectsById.TryGetValue(projectId, out var referencedProject)) continue;
-            foreach (var reference in referencedProject.ProjectReferences) pending.Enqueue(reference);
-        }
-        var compilationFiles = projectIds.SelectMany(projectId => filesByProject.GetValueOrDefault(projectId) ?? new List<SourceFile>()).ToList();
-        var compilation = ExtractorRuntime.CreateCompilation(compilationFiles);
-        foreach (var file in filesByProject[project.Id]) result[file.SyntaxTree!] = compilation;
-    }
-    var looseFiles = csFiles.Where(file => ownerByTree[file.SyntaxTree!] is null).ToList();
-    if (looseFiles.Count > 0)
-    {
-        var compilation = ExtractorRuntime.CreateCompilation(looseFiles);
-        foreach (var file in looseFiles) result[file.SyntaxTree!] = compilation;
-    }
-    return result;
 }
 
 static bool IsLikelySql(string text)
@@ -926,4 +857,4 @@ static class Args
 
 sealed record MapperReference(string OwnerClass, int OwnerMethodStart, string QueryId, int Start, SourceFile File);
 sealed record SolutionInfo(string Id, string RelativePath, string Directory, string AbsolutePath);
-sealed record ProjectInfo(string Id, string RelativePath, string Directory, List<SourceFile> SourceFiles, List<string> ProjectReferences);
+sealed record ProjectInfo(string Id, string RelativePath, string Directory, HashSet<string> SourcePaths, List<string> ProjectReferences);

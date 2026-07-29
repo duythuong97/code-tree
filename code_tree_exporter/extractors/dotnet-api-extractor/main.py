@@ -13,6 +13,33 @@ if str(PACKAGE_IMPORT_ROOT) not in sys.path:
 from code_tree_exporter.env_loader import load_dotenv
 
 
+def _packaged_extractor_command(
+    dotnet: str, config_path: Path
+) -> tuple[list[str], int]:
+    project = Path(__file__).with_name("DotNetApiExtractor.csproj")
+    assembly = (
+        project.parent / "bin" / "Release" / "net9.0" / "DotNetApiExtractor.dll"
+    )
+    sources = [
+        project,
+        *project.parent.glob("*.cs"),
+        *project.parent.parent.joinpath("_roslyn").glob("*.cs"),
+    ]
+    needs_build = not assembly.is_file() or any(
+        source.stat().st_mtime_ns > assembly.stat().st_mtime_ns
+        for source in sources
+        if source.is_file()
+    )
+    if needs_build:
+        result = subprocess.run(
+            [dotnet, "build", str(project), "-c", "Release", "--nologo"],
+            env=os.environ | {"CODE_TREE_PYTHON": sys.executable},
+        )
+        if result.returncode:
+            return [], result.returncode
+    return [dotnet, str(assembly), "--config", str(config_path)], 0
+
+
 def _worker_command(
     configured_worker: str, dotnet: str, config_path: Path
 ) -> list[str]:
@@ -58,15 +85,9 @@ def main() -> int:
             )
         else:
             print("[main.py] Running packaged Roslyn extractor.")
-        command = [
-            dotnet,
-            "run",
-            "--project",
-            str(Path(__file__).with_name("DotNetApiExtractor.csproj")),
-            "--",
-            "--config",
-            str(config_path),
-        ]
+        command, build_status = _packaged_extractor_command(dotnet, config_path)
+        if build_status:
+            return build_status
     return subprocess.run(
         command,
         env=os.environ | {"CODE_TREE_PYTHON": sys.executable},

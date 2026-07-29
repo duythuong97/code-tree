@@ -18,6 +18,7 @@ from code_tree_exporter.contract.graph_contract import (
 )
 from code_tree_exporter.extractors.package_support.package_writer import Catalog
 from code_tree_exporter.graph_package import GraphPackage
+from code_tree_exporter.markdown_export import export_markdown
 from code_tree_exporter.pipeline import run_pipeline
 from code_tree_exporter.query import KnowledgeStore
 from code_tree_exporter.v3.catalog import prepare_catalog
@@ -219,6 +220,10 @@ class V3CatalogTest(unittest.TestCase):
             self.assertGreater(health["data"]["metrics"]["nodes"], 0)
             catalog_status = store.catalog_status()
             self.assertEqual(4, len(catalog_status["data"]["catalog_files"]))
+            export_markdown(output)
+            self.assertTrue((output / "markdown-manifest.json").is_file())
+            self.assertTrue((output / "knowledge" / "manifest.json").is_file())
+            self.assertTrue((output / "quality-report.json").is_file())
 
     def test_four_database_files_compile_to_legacy_catalog_and_graph(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -14,8 +14,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="code-tree-exporter",
         description=(
-            "Extract configured source units into graph packages, codebase memory, "
-            "and RAG knowledge."
+            "Extract configured source units into a SQLite graph package."
         )
     )
     commands = parser.add_subparsers(dest="command", required=True)

@@ -22,10 +22,11 @@ var output = ExtractorRuntime.ConfigPath(config, "output");
 var catalog = Catalog.Load(inputRoot);
 var folderContexts = FolderContexts(config, root, defaultDatabase);
 var mappings = LoadExecutableMappings(Path.Combine(inputRoot, "executable-mappings.csv"));
-var files = ExtractorRuntime.ConfiguredFiles(config, new[] { ".cs", ".csproj" });
+var workspaceSnapshot = await DotNetWorkspaceLoader.LoadAsync(config, root);
+var files = workspaceSnapshot.Files;
 var csFiles = files.Where(file => file.SyntaxTree is not null).ToList();
-var projects = DiscoverProjects(files, csFiles, root, folderContexts, defaultDatabase, repository);
-var compilationByTree = CreateProjectCompilations(csFiles, projects);
+var projects = DiscoverProjects(files, csFiles, workspaceSnapshot.Projects, root, folderContexts, defaultDatabase, repository);
+var compilationByTree = workspaceSnapshot.CompilationByTree;
 
 var builder = new PackageBuilder(
     $"dotnet-batch-{source}",
@@ -39,8 +40,13 @@ var builder = new PackageBuilder(
         ["parser"] = "Microsoft.CodeAnalysis.CSharp",
         ["extractorContract"] = "3.0",
         ["capabilities"] = new[] { "batch-input-output", "command-mode-lineage", "database-lineage", "semantic-summary" },
+        ["workspace"] = "MSBuildWorkspace",
+        ["workspaceProjectCount"] = workspaceSnapshot.LoadedProjectCount,
+        ["fallbackFileCount"] = workspaceSnapshot.FallbackFileCount,
     });
 builder.FilesScanned = files.Count;
+
+AddWorkspaceIssues(builder, workspaceSnapshot, csFiles);
 
 var projectsById = projects.ToDictionary(project => project.Id, StringComparer.Ordinal);
 foreach (var project in projects)
@@ -54,13 +60,6 @@ foreach (var project in projects)
             builder.AddEdge(project.Id, target.Id, "PROJECT_REFERENCE", "STRUCTURAL");
 }
 
-foreach (var file in csFiles)
-{
-    var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
-    foreach (var cls in ExtractorRuntime.Classes(file))
-        _ = model.GetDeclaredSymbol(cls); // Roslyn SemanticModel proof point: class symbol binding.
-}
-
 var methods = DiscoverMethods(csFiles, compilationByTree, projects, root);
 var methodLookup = methods
     .GroupBy(method => method.Key)
@@ -68,8 +67,8 @@ var methodLookup = methods
 var invocations = new List<MethodInvocationInfo>();
 foreach (var file in csFiles)
 {
-    var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
-    var visibleClassNames = VisibleClassNames(model.Compilation);
+    var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
+    var visibleClassNames = ExtractorRuntime.CompilationIndex(model.Compilation).VisibleClassNames();
     invocations.AddRange(ExtractorRuntime.MethodInvocationEdges(file, model, visibleClassNames));
     invocations.AddRange(TopLevelInvocationEdges(file, model, visibleClassNames));
 }
@@ -175,8 +174,8 @@ foreach (var executable in executables.OrderBy(exe => exe.Name, StringComparer.O
 
     SemanticCallResolution? ResolveSemanticCall(InvocationExpressionSyntax invocation)
     {
-        var model = compilationByTree[invocation.SyntaxTree].GetSemanticModel(invocation.SyntaxTree);
-        var target = ResolveInvocationTarget(invocation, model, VisibleClassNames(model.Compilation));
+        var model = SemanticModelFor(compilationByTree, invocation.SyntaxTree);
+        var target = ResolveInvocationTarget(invocation, model, ExtractorRuntime.CompilationIndex(model.Compilation).VisibleClassNames());
         if (target is null) return new SemanticCallResolution("unresolved");
         target = CanonicalKey(target, methodLookup);
         var label = $"Call {target.ClassName}.{target.MemberName}";
@@ -217,14 +216,55 @@ foreach (var executable in executables.OrderBy(exe => exe.Name, StringComparer.O
 AddJobEdges(builder, inputRoot, executables, scope);
 builder.Write(output);
 
-static List<ProjectInfo> DiscoverProjects(List<SourceFile> files, List<SourceFile> csFiles, string root, List<FolderContext> folderContexts, string defaultDatabase, string repository)
+static SemanticModel SemanticModelFor(IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilations, SyntaxTree tree)
+    => ExtractorRuntime.CompilationIndex(compilations[tree]).SemanticModel(tree);
+
+static void AddWorkspaceIssues(PackageBuilder builder, DotNetWorkspaceSnapshot snapshot, IReadOnlyCollection<SourceFile> csFiles)
+{
+    var syntaxErrorCount = csFiles.Sum(file => file.SyntaxTree!.GetDiagnostics().Count(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error));
+    if (syntaxErrorCount > 0)
+    {
+        builder.AddIssue(
+            "CSHARP_PARSE_ERROR",
+            "WARNING",
+            $"Roslyn found {syntaxErrorCount} C# syntax error(s); valid syntax and available semantic links are retained",
+            properties: new Dictionary<string, object> { ["syntaxErrorCount"] = syntaxErrorCount });
+    }
+    if (snapshot.Diagnostics.Count > 0)
+    {
+        builder.AddIssue(
+            "MSBUILD_WORKSPACE_DIAGNOSTIC",
+            "WARNING",
+            $"MSBuildWorkspace reported {snapshot.Diagnostics.Count} load diagnostic(s); affected projects use best-effort extraction",
+            properties: new Dictionary<string, object>
+            {
+                ["diagnosticCount"] = snapshot.Diagnostics.Count,
+                ["samples"] = snapshot.Diagnostics.Take(10).ToArray(),
+            });
+    }
+    if (snapshot.FallbackFileCount > 0)
+    {
+        builder.AddIssue(
+            "MSBUILD_WORKSPACE_FALLBACK",
+            "WARNING",
+            $"{snapshot.FallbackFileCount} C# file(s) were not loaded by a project and use a fallback compilation",
+            properties: new Dictionary<string, object> { ["fallbackFileCount"] = snapshot.FallbackFileCount });
+    }
+}
+
+static List<ProjectInfo> DiscoverProjects(List<SourceFile> files, List<SourceFile> csFiles, IReadOnlyList<WorkspaceProjectInfo> workspaceProjects, string root, List<FolderContext> folderContexts, string defaultDatabase, string repository)
 {
     var projects = new List<ProjectInfo>();
+    var workspaceByPath = workspaceProjects.ToDictionary(project => project.FilePath, ExtractorRuntime.PathComparer);
     foreach (var file in files.Where(file => Path.GetExtension(file.AbsolutePath).Equals(".csproj", StringComparison.OrdinalIgnoreCase)).OrderBy(file => file.AbsolutePath, StringComparer.Ordinal))
     {
         var relativePath = ExtractorRuntime.RepositoryPath(Path.GetRelativePath(root, file.AbsolutePath));
         var directory = Path.GetDirectoryName(file.AbsolutePath) ?? root;
-        var projectFiles = csFiles.Where(source => IsUnderDirectory(source.AbsolutePath, directory)).ToList();
+        workspaceByPath.TryGetValue(file.AbsolutePath, out var workspaceProject);
+        var projectFiles = workspaceProject is null
+            ? csFiles.Where(source => IsUnderDirectory(source.AbsolutePath, directory)).ToList()
+            : csFiles.Where(source => workspaceProject.DocumentPaths.Contains(source.AbsolutePath, ExtractorRuntime.PathComparer)).ToList();
+        var sourcePaths = projectFiles.Select(source => source.AbsolutePath).ToHashSet(ExtractorRuntime.PathComparer);
         var outputType = MsBuildProjectXml.Property(file.Text, "OutputType");
         var assemblyName = MsBuildProjectXml.Property(file.Text, "AssemblyName");
         if (string.IsNullOrWhiteSpace(assemblyName)) assemblyName = Path.GetFileNameWithoutExtension(file.AbsolutePath);
@@ -244,8 +284,14 @@ static List<ProjectInfo> DiscoverProjects(List<SourceFile> files, List<SourceFil
             targetName,
             outputType,
             isExecutable,
-            projectFiles,
-            ProjectReferenceIds(file.Text, directory, root, repository)));
+            sourcePaths,
+            ProjectReferenceIds(
+                workspaceProject?.ProjectReferencePaths
+                    ?? MsBuildProjectXml.Includes(file.Text, "ProjectReference")
+                        .Select(include => Path.GetFullPath(Path.Combine(directory, ExtractorRuntime.NativePath(include))))
+                        .ToList(),
+                root,
+                repository)));
     }
     return projects;
 }
@@ -317,7 +363,7 @@ static List<MethodDeclarationInfo> DiscoverMethods(List<SourceFile> csFiles, IRe
     foreach (var file in csFiles)
     {
         var rootNode = file.SyntaxTree!.GetRoot();
-        var model = compilationByTree[file.SyntaxTree].GetSemanticModel(file.SyntaxTree);
+        var model = SemanticModelFor(compilationByTree, file.SyntaxTree);
         var firstGlobalStatement = rootNode.DescendantNodes().OfType<GlobalStatementSyntax>().FirstOrDefault();
         if (firstGlobalStatement is not null)
             methods.Add(new MethodDeclarationInfo(TopLevelKey(file), file, firstGlobalStatement.SpanStart, true, rootNode));
@@ -353,8 +399,8 @@ static List<CommandHandlerInfo> DiscoverCommandHandlers(List<SourceFile> csFiles
     var handlers = new List<CommandHandlerInfo>();
     foreach (var file in csFiles)
     {
-        var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
-        var classNames = VisibleClassNames(model.Compilation);
+        var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
+        var classNames = ExtractorRuntime.CompilationIndex(model.Compilation).VisibleClassNames();
         var root = file.SyntaxTree!.GetRoot();
         foreach (var ifStatement in root.DescendantNodes().OfType<IfStatementSyntax>())
         {
@@ -479,7 +525,7 @@ static List<DataFinding> CollectDataFindings(List<SourceFile> csFiles, IReadOnly
     var findings = new List<DataFinding>();
     foreach (var file in csFiles)
     {
-        var model = compilationByTree[file.SyntaxTree!].GetSemanticModel(file.SyntaxTree!);
+        var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
         var database = DatabaseForPath(file.AbsolutePath, folderContexts, defaultDatabase);
         foreach (var expression in ExtractorRuntime.StringExpressions(file, model))
         {
@@ -669,10 +715,9 @@ static List<ExecutableInfo> ResolveCanonicalExecutable(string canonical, Diction
 static List<ExecutableInfo> Lookup(Dictionary<string, List<ExecutableInfo>> index, string key)
     => index.TryGetValue(key, out var values) ? values : new List<ExecutableInfo>();
 
-static List<string> ProjectReferenceIds(string text, string directory, string root, string repository)
+static List<string> ProjectReferenceIds(IEnumerable<string> paths, string root, string repository)
 {
-    return MsBuildProjectXml.Includes(text, "ProjectReference")
-        .Select(include => Path.GetFullPath(Path.Combine(directory, ExtractorRuntime.NativePath(include))))
+    return paths
         .Where(path => ExtractorRuntime.IsWithin(path, root))
         .Select(path => ExtractorRuntime.RepositoryPath(Path.GetRelativePath(root, path)))
         .Select(path => ExtractorRuntime.StableNodeId("dotnet-project", repository, path))
@@ -723,7 +768,8 @@ static bool FileBelongsToExecutable(SourceFile file, ExecutableInfo executable)
 {
     if (executable.Projects.Count == 0)
         return executable.LooseEntryFiles.Count == 0 || executable.LooseEntryFiles.Any(entry => entry.AbsolutePath.Equals(file.AbsolutePath, StringComparison.OrdinalIgnoreCase)) || executable.LooseEntryFiles.Any(entry => Path.GetDirectoryName(entry.AbsolutePath)?.Equals(Path.GetDirectoryName(file.AbsolutePath), StringComparison.OrdinalIgnoreCase) == true);
-    return executable.Projects.Any(project => IsUnderDirectory(file.AbsolutePath, project.Directory));
+    return executable.Projects.Any(project => project.SourcePaths.Contains(file.AbsolutePath))
+        || executable.Projects.Any(project => IsUnderDirectory(file.AbsolutePath, project.Directory));
 }
 
 static bool IsUnderDirectory(string path, string directory)
@@ -785,15 +831,9 @@ static IMethodSymbol? InvocationMethodSymbol(InvocationExpressionSyntax invocati
 static IMethodSymbol? ResolveInterfaceImplementation(IMethodSymbol symbol, Compilation compilation, IReadOnlyCollection<string> knownClasses)
 {
     if (symbol.ContainingType.TypeKind != TypeKind.Interface) return null;
-    var implementations = compilation.SyntaxTrees
-        .SelectMany(tree => tree.GetRoot().DescendantNodes().OfType<TypeDeclarationSyntax>())
-        .Select(type => compilation.GetSemanticModel(type.SyntaxTree).GetDeclaredSymbol(type))
-        .OfType<INamedTypeSymbol>()
-        .Where(type => knownClasses.Contains(type.Name) && type.AllInterfaces.Any(contract => SymbolEqualityComparer.Default.Equals(contract, symbol.ContainingType)))
-        .Select(type => type.FindImplementationForInterfaceMember(symbol))
-        .OfType<IMethodSymbol>()
-        .Distinct<ISymbol>(SymbolEqualityComparer.Default)
-        .OfType<IMethodSymbol>()
+    var implementations = ExtractorRuntime.CompilationIndex(compilation)
+        .InterfaceImplementations(symbol)
+        .Where(implementation => knownClasses.Contains(implementation.ContainingType.Name))
         .ToArray();
     return implementations.Length == 1 ? implementations[0] : null;
 }
@@ -802,10 +842,9 @@ static string MatchKnownClass(string typeName, HashSet<string> knownClasses)
 {
     if (string.IsNullOrWhiteSpace(typeName)) return string.Empty;
     var clean = typeName.Split('.').Last();
-    var exact = knownClasses.FirstOrDefault(name => name.Equals(clean, StringComparison.Ordinal));
-    if (!string.IsNullOrEmpty(exact)) return exact;
+    if (knownClasses.Contains(clean)) return clean;
     if (clean.StartsWith("I", StringComparison.Ordinal) && clean.Length > 1 && char.IsUpper(clean[1]))
-        return knownClasses.FirstOrDefault(name => name.Equals(clean[1..], StringComparison.Ordinal)) ?? string.Empty;
+        return knownClasses.Contains(clean[1..]) ? clean[1..] : string.Empty;
     return string.Empty;
 }
 
@@ -890,44 +929,11 @@ static string ScopedTypeIdentity(INamedTypeSymbol? type, SourceFile file, IReadO
 }
 
 static ProjectInfo? ProjectForFile(SourceFile file, IReadOnlyCollection<ProjectInfo> projects)
-    => projects.Where(project => IsUnderDirectory(file.AbsolutePath, project.Directory)).OrderByDescending(project => project.Directory.Length).FirstOrDefault();
-
-static Dictionary<SyntaxTree, CSharpCompilation> CreateProjectCompilations(List<SourceFile> csFiles, List<ProjectInfo> projects)
-{
-    var ownerByTree = csFiles.ToDictionary(file => file.SyntaxTree!, file => ProjectForFile(file, projects));
-    var filesByProject = projects.ToDictionary(
-        project => project.Id,
-        project => csFiles.Where(file => ownerByTree[file.SyntaxTree!]?.Id == project.Id).ToList(),
-        StringComparer.Ordinal);
-    var projectsById = projects.ToDictionary(project => project.Id, StringComparer.Ordinal);
-    var result = new Dictionary<SyntaxTree, CSharpCompilation>();
-    foreach (var project in projects)
-    {
-        var projectIds = new HashSet<string>(StringComparer.Ordinal) { project.Id };
-        var pending = new Queue<string>(project.ProjectReferences);
-        while (pending.TryDequeue(out var projectId))
-        {
-            if (!projectIds.Add(projectId) || !projectsById.TryGetValue(projectId, out var referencedProject)) continue;
-            foreach (var reference in referencedProject.ProjectReferences) pending.Enqueue(reference);
-        }
-        var compilationFiles = projectIds.SelectMany(projectId => filesByProject.GetValueOrDefault(projectId) ?? new List<SourceFile>()).ToList();
-        var compilation = ExtractorRuntime.CreateCompilation(compilationFiles);
-        foreach (var file in filesByProject[project.Id]) result[file.SyntaxTree!] = compilation;
-    }
-    var looseFiles = csFiles.Where(file => ownerByTree[file.SyntaxTree!] is null).ToList();
-    if (looseFiles.Count > 0)
-    {
-        var compilation = ExtractorRuntime.CreateCompilation(looseFiles);
-        foreach (var file in looseFiles) result[file.SyntaxTree!] = compilation;
-    }
-    return result;
-}
-
-static HashSet<string> VisibleClassNames(Compilation compilation)
-    => compilation.SyntaxTrees
-        .SelectMany(tree => tree.GetRoot().DescendantNodes().OfType<ClassDeclarationSyntax>())
-        .Select(cls => cls.Identifier.Text)
-        .ToHashSet(StringComparer.Ordinal);
+    => projects
+        .Where(project => project.SourcePaths.Contains(file.AbsolutePath))
+        .OrderByDescending(project => project.Directory.Length)
+        .FirstOrDefault()
+        ?? projects.Where(project => IsUnderDirectory(file.AbsolutePath, project.Directory)).OrderByDescending(project => project.Directory.Length).FirstOrDefault();
 
 static string DeclarationIdentity(SyntaxTree tree, int start)
     => $"{tree.FilePath}:{start.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
@@ -967,7 +973,7 @@ sealed record MethodKey(string ClassName, string MemberName, string Identity = "
 sealed record MethodDeclarationInfo(MethodKey Key, SourceFile File, int Start, bool IsEntryPoint, SyntaxNode Syntax);
 sealed record CommandHandlerInfo(string Mode, MethodKey Source, MethodKey Handler, SourceFile File, int Start, SyntaxNode Syntax);
 sealed record FolderContext(string AbsolutePath, string Database);
-sealed record ProjectInfo(string Id, string RelativePath, string Directory, string Database, string AssemblyName, string TargetName, string OutputType, bool IsExecutable, List<SourceFile> SourceFiles, List<string> ProjectReferences);
+sealed record ProjectInfo(string Id, string RelativePath, string Directory, string Database, string AssemblyName, string TargetName, string OutputType, bool IsExecutable, HashSet<string> SourcePaths, List<string> ProjectReferences);
 sealed record ExecutableMapping(string JobSystem, string ExecutableName, string ExecutableScope, string CanonicalExecutableName, string Alias);
 
 abstract record DataFinding(MethodKey Owner, SourceFile File, int Line, string Database);
