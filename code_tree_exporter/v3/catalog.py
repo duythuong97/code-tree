@@ -142,7 +142,6 @@ class NormalizedCsv:
 @dataclass
 class CatalogImportResult:
     normalized_root: Path
-    catalog_root: Path
     tables: dict[tuple[str, str, str], CatalogTable] = field(default_factory=dict)
     columns: dict[tuple[str, str, str, str], CatalogColumn] = field(default_factory=dict)
     normalized_csvs: dict[str, NormalizedCsv] = field(default_factory=dict)
@@ -366,7 +365,7 @@ def prepare_catalog(
     else:
         normalized_root.mkdir(parents=True, exist_ok=True)
 
-    result = CatalogImportResult(normalized_root, catalog_root)
+    result = CatalogImportResult(normalized_root)
     profiles = _load_profiles(catalog_root / "profiles")
     duplicate_policy = str(options.get("duplicatePolicy") or "error").lower()
     if duplicate_policy not in {"error", "first-wins", "last-wins"}:

@@ -36,10 +36,8 @@ obj/
 # Build / generated output
 build/
 dist/
+.artifacts/
 *.log
 *.tmp
 
-output/*
-output-*
-*output-*
 demo-*

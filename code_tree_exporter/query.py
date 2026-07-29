@@ -34,14 +34,9 @@ class KnowledgeStore:
     def __init__(self, output: Path) -> None:
         self.output = output.expanduser().resolve()
         self.manifest = self._load_json(self.output / "manifest.json")
-        self.index = self._load_json(self.output / "graph-index.json")
-        if self.index.get("indexVersion") != "2.0":
-            raise ValueError(
-                f"Unsupported graph index version: {self.index.get('indexVersion')!r}"
-            )
+        self._index: dict[str, object] | None = None
         configured = str(
             self.manifest.get("files", {}).get("database")
-            or self.index.get("database")
             or "graph.sqlite"
         )
         database = self.output / configured
@@ -49,6 +44,17 @@ class KnowledgeStore:
             raise ValueError(f"SQLite graph database not found: {database}")
         self.database = database
         self.database_uri = f"{database.as_uri()}?mode=ro"
+
+    @property
+    def index(self) -> dict[str, object]:
+        if self._index is None:
+            index = self._load_json(self.output / "graph-index.json")
+            if index.get("indexVersion") != "2.0":
+                raise ValueError(
+                    f"Unsupported graph index version: {index.get('indexVersion')!r}"
+                )
+            self._index = index
+        return self._index
 
     def find_node(
         self,
@@ -62,24 +68,25 @@ class KnowledgeStore:
             rows = self._rows_by_identity("nodes", "node_id", node_id)
             return self._response(f"Found {len(rows)} node(s).", nodes=rows)
         elif qualified_name:
-            names = self.index.get("qualifiedNames", {})
-            locators = list(names.get(qualified_name.casefold(), ()))
-            if not locators:
+            rows = self._query_rows(
+                "SELECT * FROM nodes WHERE qualified_name = ? COLLATE NOCASE "
+                "ORDER BY node_id LIMIT ?",
+                (qualified_name, limit),
+            )
+            if not rows:
                 rows = self._query_rows(
-                    "SELECT * FROM nodes WHERE qualified_name LIKE ? "
+                    "SELECT * FROM nodes WHERE qualified_name LIKE ? COLLATE NOCASE "
                     "ORDER BY node_id LIMIT ?",
                     (f"%{qualified_name}%", limit),
                 )
-                return self._response(f"Found {len(rows)} node(s).", nodes=rows)
         elif node_type:
-            locators = list(
-                self.index.get("nodesByType", {}).get(node_type.upper(), ())
+            rows = self._query_rows(
+                "SELECT * FROM nodes WHERE node_type = ? COLLATE NOCASE "
+                "ORDER BY node_id LIMIT ?",
+                (node_type, limit),
             )
         else:
             raise ValueError("findNode requires id, qualified_name, or type")
-        rows = self._rows_from_locators(
-            locators[:limit], "nodes", "nodeId", "node_id"
-        )
         return self._response(
             f"Found {len(rows)} node(s).",
             nodes=rows,
@@ -93,32 +100,30 @@ class KnowledgeStore:
         edge_type: str = "",
         limit: int = 200,
     ) -> dict[str, object]:
-        indexes = []
+        clauses = []
+        parameters: list[object] = []
         if source:
             source = self._resolve_identifier("nodes", "node_id", source) or ""
-            indexes.append(
-                self.index.get("edgesBySource", {}).get(source, ())
-            )
+            if not source:
+                return self._response("Found 0 edge(s).")
+            clauses.append("source_node_id = ?")
+            parameters.append(int(source))
         if target:
             target = self._resolve_identifier("nodes", "node_id", target) or ""
-            indexes.append(
-                self.index.get("edgesByTarget", {}).get(target, ())
-            )
+            if not target:
+                return self._response("Found 0 edge(s).")
+            clauses.append("target_node_id = ?")
+            parameters.append(int(target))
         if edge_type:
-            indexes.append(
-                self.index.get("edgesByType", {}).get(edge_type.upper(), ())
-            )
-        if not indexes:
+            clauses.append("edge_type = ? COLLATE NOCASE")
+            parameters.append(edge_type)
+        if not clauses:
             raise ValueError("findEdges requires source, target, or type")
-        locator_maps = [
-            {item["edgeId"]: item for item in values} for values in indexes
-        ]
-        edge_ids = set(locator_maps[0])
-        for mapping in locator_maps[1:]:
-            edge_ids.intersection_update(mapping)
-        locators = [locator_maps[0][edge_id] for edge_id in sorted(edge_ids)]
-        rows = self._rows_from_locators(
-            locators[:limit], "edges", "edgeId", "edge_id"
+        rows = self._query_rows(
+            "SELECT * FROM edges WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY edge_id LIMIT ?",
+            (*parameters, limit),
         )
         return self._response(f"Found {len(rows)} edge(s).", edges=rows)
 
@@ -169,19 +174,7 @@ class KnowledgeStore:
 
     def impact_api(self, method: str, path: str) -> dict[str, object]:
         verb, route = normalize_http_route(method, path)
-        api_index = self.index.get("apisByMethodPath", {})
-        locators = list(api_index.get(f"{verb} {route}", ()))
-        if not locators:
-            locators = [
-                locator
-                for signature, values in api_index.items()
-                if signature.startswith(verb + " ")
-                and _route_matches(signature.split(" ", 1)[1], route)
-                for locator in values
-            ]
-        starts = self._rows_from_locators(
-            locators, "nodes", "nodeId", "node_id"
-        )
+        starts = self._api_nodes_for_route(verb, route)
         return self._trace_response(
             starts,
             direction="out",
@@ -195,17 +188,18 @@ class KnowledgeStore:
         needle = ".".join(
             value for value in (database, schema, table) if value
         ).upper()
-        table_locators = []
-        for qualified, values in self.index.get("tablesByQName", {}).items():
-            if (
-                qualified == needle
-                or qualified.endswith("." + needle)
-                or qualified.endswith(":" + needle.replace(".", ":"))
-            ):
-                table_locators.extend(values)
-        starts = self._rows_from_locators(
-            table_locators, "nodes", "nodeId", "node_id"
+        candidates = self._query_rows(
+            "SELECT * FROM nodes WHERE node_type IN "
+            "('TABLE', 'VIEW', 'MATERIALIZED_VIEW', "
+            "'EXTERNAL_DATABASE_OBJECT', 'UNRESOLVED_REFERENCE') "
+            "ORDER BY node_id"
         )
+        starts = [
+            node
+            for node in candidates
+            if _matches_target(node, _DB_TYPES)
+            and _matches_table_lookup(node, needle)
+        ]
         return self._trace_response(
             starts,
             direction="in",
@@ -241,12 +235,7 @@ class KnowledgeStore:
             except ValueError:
                 pass
             else:
-                locators = self.index.get("apisByMethodPath", {}).get(
-                    f"{verb} {route}", ()
-                )
-                candidates = self._rows_from_locators(
-                    locators, "nodes", "nodeId", "node_id"
-                )
+                candidates = self._api_nodes_for_route(verb, route)
         return self._trace_response(
             list(candidates),
             direction="out",
@@ -466,6 +455,29 @@ class KnowledgeStore:
             extra={"catalog_files": rows},
         )
 
+    def _api_nodes_for_route(
+        self, verb: str, route: str
+    ) -> list[dict[str, str]]:
+        candidates = self._query_rows(
+            "SELECT * FROM nodes WHERE node_type = 'API_OPERATION' "
+            "ORDER BY node_id"
+        )
+        exact = []
+        compatible = []
+        for node in candidates:
+            properties = _node_properties(node)
+            candidate_method = str(properties.get("method") or "").upper()
+            candidate_route = str(
+                properties.get("route") or properties.get("path") or ""
+            )
+            if candidate_method != verb:
+                continue
+            if candidate_route == route:
+                exact.append(node)
+            elif _route_matches(candidate_route, route):
+                compatible.append(node)
+        return exact or compatible
+
     def _trace_response(
         self,
         starts: list[dict[str, str]],
@@ -474,6 +486,9 @@ class KnowledgeStore:
         target_types: frozenset[str],
         answer_prefix: str,
         max_depth: int = 8,
+        max_nodes: int = 5_000,
+        max_edges: int = 10_000,
+        max_evidence: int = 5_000,
     ) -> dict[str, object]:
         start_ids = [row["node_id"] for row in starts]
         nodes = {row["node_id"]: row for row in starts}
@@ -481,38 +496,65 @@ class KnowledgeStore:
         targets: set[str] = set()
         queue = deque((node_id, 0) for node_id in start_ids)
         visited = set(start_ids)
-        while queue:
-            current, depth = queue.popleft()
-            if depth >= max_depth:
-                continue
-            response = (
-                self.find_edges(source=current)
-                if direction == "out"
-                else self.find_edges(target=current)
-            )
-            for edge in response["data"].get("edges", []):
-                next_id = (
-                    edge.get("target_node_id", "")
-                    if direction == "out"
-                    else edge.get("source_node_id", "")
-                )
-                if not next_id:
+        truncated = False
+        connection = sqlite3.connect(self.database_uri, uri=True)
+        try:
+            connection.row_factory = sqlite3.Row
+            edge_column = "source_node_id" if direction == "out" else "target_node_id"
+            next_column = "target_node_id" if direction == "out" else "source_node_id"
+            while queue:
+                if len(nodes) >= max_nodes or len(edges) >= max_edges:
+                    truncated = True
+                    break
+                current, depth = queue.popleft()
+                if depth >= max_depth:
                     continue
-                edges[edge["edge_id"]] = edge
-                node_rows = self.find_node(node_id=next_id)["data"].get("nodes", [])
-                if not node_rows:
-                    continue
-                nodes[next_id] = node_rows[0]
-                if _matches_target(node_rows[0], target_types):
-                    targets.add(next_id)
-                if next_id not in visited:
-                    visited.add(next_id)
-                    queue.append((next_id, depth + 1))
-        evidence = []
-        for target_id in [*nodes, *edges]:
-            evidence.extend(
-                self.find_evidence(target_id)["evidence_refs"]
+                edge_rows = [
+                    _sqlite_row(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM edges WHERE {edge_column} = ? ORDER BY edge_id",
+                        (int(current),),
+                    )
+                ]
+                available = max_edges - len(edges)
+                if len(edge_rows) > available:
+                    edge_rows = edge_rows[:available]
+                    truncated = True
+                next_ids = {
+                    edge.get(next_column, "")
+                    for edge in edge_rows
+                    if edge.get(next_column, "")
+                }
+                missing_ids = sorted(next_ids.difference(nodes), key=int)
+                if missing_ids:
+                    placeholders = ",".join("?" for _ in missing_ids)
+                    for row in connection.execute(
+                        f"SELECT * FROM nodes WHERE node_id IN ({placeholders})",
+                        tuple(int(node_id) for node_id in missing_ids),
+                    ):
+                        node = _sqlite_row(row)
+                        nodes[node["node_id"]] = node
+                for edge in edge_rows:
+                    next_id = edge.get(next_column, "")
+                    if not next_id or next_id not in nodes:
+                        continue
+                    edges[edge["edge_id"]] = edge
+                    node = nodes[next_id]
+                    if _matches_target(node, target_types):
+                        targets.add(next_id)
+                    elif next_id not in visited:
+                        visited.add(next_id)
+                        queue.append((next_id, depth + 1))
+            evidence = _trace_evidence(
+                connection,
+                node_ids=nodes,
+                edge_ids=edges,
+                limit=max_evidence,
             )
+            if len(evidence) >= max_evidence:
+                truncated = True
+        finally:
+            connection.close()
         return self._response(
             f"{answer_prefix}: {len(starts)} start node(s), {len(targets)} impacted target(s).",
             nodes=list(nodes.values()),
@@ -531,6 +573,7 @@ class KnowledgeStore:
                     for node_id in targets
                     if node_id in nodes
                 ),
+                "truncated": truncated,
             },
         )
 
@@ -579,29 +622,6 @@ class KnowledgeStore:
             "issues": issues,
             "data": data,
         }
-
-    def _rows_from_locators(
-        self,
-        locators: Iterable[dict[str, str]],
-        kind: str,
-        locator_id: str,
-        row_id: str,
-    ) -> list[dict[str, str]]:
-        wanted = set()
-        for locator in locators:
-            identity = locator.get(locator_id)
-            if identity:
-                wanted.add(identity)
-        if not wanted:
-            return []
-        table = _sqlite_table(kind)
-        column = _sqlite_identity_column(row_id)
-        placeholders = ",".join("?" for _ in wanted)
-        return self._query_rows(
-            f"SELECT * FROM {table} WHERE {column} IN ({placeholders}) "
-            f"ORDER BY {column}",
-            tuple(int(value) for value in sorted(wanted, key=int)),
-        )
 
     def _rows_by_identity(
         self, table: str, identity_column: str, identity: str
@@ -822,6 +842,81 @@ def _sqlite_row(row: sqlite3.Row) -> dict[str, str]:
         key: "" if row[key] is None else str(row[key])
         for key in row.keys()
     }
+
+
+def _node_properties(node: dict[str, str]) -> dict[str, object]:
+    try:
+        value = json.loads(node.get("properties_json") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _trace_evidence(
+    connection: sqlite3.Connection,
+    *,
+    node_ids: dict[str, dict[str, str]],
+    edge_ids: dict[str, dict[str, str]],
+    limit: int,
+) -> list[dict[str, str]]:
+    evidence: list[dict[str, str]] = []
+    for target_type, identifiers in (
+        ("NODE", node_ids),
+        ("EDGE", edge_ids),
+    ):
+        values = sorted(identifiers, key=int)
+        for offset in range(0, len(values), 500):
+            if len(evidence) >= limit:
+                return evidence[:limit]
+            chunk = values[offset : offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            remaining = limit - len(evidence)
+            evidence.extend(
+                _sqlite_row(row)
+                for row in connection.execute(
+                    "SELECT * FROM evidence WHERE target_type = ? "
+                    f"AND target_id IN ({placeholders}) "
+                    "ORDER BY evidence_id LIMIT ?",
+                    (target_type, *(int(value) for value in chunk), remaining),
+                )
+            )
+    return evidence[:limit]
+
+
+def _matches_table_lookup(node: dict[str, str], needle: str) -> bool:
+    properties = _node_properties(node)
+    database = str(
+        node.get("database_key")
+        or properties.get("database")
+        or properties.get("database_key")
+        or ""
+    ).upper()
+    schema = str(properties.get("schema") or properties.get("owner") or "").upper()
+    name = str(
+        properties.get("table")
+        or properties.get("object_name")
+        or node.get("technical_name")
+        or ""
+    ).upper()
+    if "." in name:
+        parts = [part.strip('"') for part in name.split(".") if part]
+        if len(parts) >= 2 and not schema:
+            schema = parts[-2]
+        name = parts[-1]
+    keys = {
+        str(node.get("qualified_name") or "").upper(),
+        str(node.get("stable_id") or "").upper(),
+        name,
+        ".".join(part for part in (database, name) if part),
+        ".".join(part for part in (database, schema, name) if part),
+    }
+    return any(
+        key == needle
+        or key.endswith("." + needle)
+        or key.endswith(":" + needle.replace(".", ":"))
+        for key in keys
+        if key
+    )
 
 
 def _dedupe_rows(

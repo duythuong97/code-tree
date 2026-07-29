@@ -27,6 +27,7 @@ _WRITE_EDGES = frozenset(
 )
 _FLOW_EDGES = frozenset(
     {
+        "CONTAINS",
         "CALLS_API",
         "STARTS",
         "CALLS",

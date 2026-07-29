@@ -52,9 +52,27 @@ public static class DotNetWorkspaceLoader
                     projectPaths.Add(projectPath);
 
         var diagnostics = new List<string>();
+        var projectTimeoutSeconds = ProjectTimeoutSeconds(config);
+        var solutionDirectory = solutionPaths.Count == 1
+            ? Path.GetDirectoryName(solutionPaths[0]) ?? root
+            : root;
+        var configuredOutput = ExtractorRuntime.ConfigPath(config, "output", root);
+        var workspaceOutput = Path.Combine(
+            Path.GetDirectoryName(configuredOutput) ?? root,
+            ".msbuild",
+            Path.GetFileName(configuredOutput));
+        Directory.CreateDirectory(workspaceOutput);
+        var outputDirectory = EnsureTrailingSeparator(workspaceOutput);
         using var workspace = MSBuildWorkspace.Create(new Dictionary<string, string>
         {
             ["Configuration"] = "Release",
+            ["DesignTimeBuild"] = "true",
+            ["BuildingInsideVisualStudio"] = "true",
+            ["BuildProjectReferences"] = "false",
+            ["SkipCompilerExecution"] = "true",
+            ["SolutionDir"] = EnsureTrailingSeparator(solutionDirectory),
+            ["OutputPath"] = outputDirectory,
+            ["OutDir"] = outputDirectory,
         });
         workspace.SkipUnrecognizedProjects = true;
         workspace.WorkspaceFailed += (_, eventArgs) =>
@@ -69,28 +87,14 @@ public static class DotNetWorkspaceLoader
                 && ExtractorRuntime.IsWithin(projectPath, root)
                 && !ExtractorRuntime.IsExcludedSourcePath(projectPath, root));
         if (canOpenConfiguredSolution)
-        {
-            try
-            {
-                await workspace.OpenSolutionAsync(solutionPaths[0]);
-            }
-            catch (Exception exception)
-            {
-                diagnostics.Add($"Failed to load {solutionPaths[0]}: {exception.Message}");
-            }
-        }
+            await TryOpenSolutionAsync(
+                workspace, solutionPaths[0], projectTimeoutSeconds, diagnostics);
 
         foreach (var projectPath in RootProjectPaths(projectPaths))
         {
             if (WorkspaceContainsProject(workspace, projectPath)) continue;
-            try
-            {
-                await workspace.OpenProjectAsync(projectPath);
-            }
-            catch (Exception exception)
-            {
-                diagnostics.Add($"Failed to load {projectPath}: {exception.Message}");
-            }
+            await TryOpenProjectAsync(
+                workspace, projectPath, projectTimeoutSeconds, diagnostics);
         }
 
         // Structural project detection can miss conditional references. Open any
@@ -98,14 +102,8 @@ public static class DotNetWorkspaceLoader
         foreach (var projectPath in projectPaths.OrderBy(path => path, ExtractorRuntime.PathComparer))
         {
             if (WorkspaceContainsProject(workspace, projectPath)) continue;
-            try
-            {
-                await workspace.OpenProjectAsync(projectPath);
-            }
-            catch (Exception exception)
-            {
-                diagnostics.Add($"Failed to load {projectPath}: {exception.Message}");
-            }
+            await TryOpenProjectAsync(
+                workspace, projectPath, projectTimeoutSeconds, diagnostics);
         }
 
         var filesByPath = new Dictionary<string, SourceFile>(ExtractorRuntime.PathComparer);
@@ -248,6 +246,62 @@ public static class DotNetWorkspaceLoader
                 MSBuildLocator.RegisterDefaults();
         }
     }
+
+    static async Task TryOpenSolutionAsync(
+        MSBuildWorkspace workspace,
+        string path,
+        int timeoutSeconds,
+        List<string> diagnostics)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+        try
+        {
+            await workspace.OpenSolutionAsync(path, cancellationToken: timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            diagnostics.Add($"Timed out loading {path} after {timeoutSeconds} seconds");
+        }
+        catch (Exception exception)
+        {
+            diagnostics.Add($"Failed to load {path}: {exception.Message}");
+        }
+    }
+
+    static async Task TryOpenProjectAsync(
+        MSBuildWorkspace workspace,
+        string path,
+        int timeoutSeconds,
+        List<string> diagnostics)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+        try
+        {
+            await workspace.OpenProjectAsync(path, cancellationToken: timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            diagnostics.Add($"Timed out loading {path} after {timeoutSeconds} seconds");
+        }
+        catch (Exception exception)
+        {
+            diagnostics.Add($"Failed to load {path}: {exception.Message}");
+        }
+    }
+
+    static int ProjectTimeoutSeconds(JsonElement config)
+    {
+        if (config.TryGetProperty("limits", out var limits)
+            && limits.ValueKind == JsonValueKind.Object
+            && limits.TryGetProperty("projectTimeoutSeconds", out var value)
+            && value.TryGetInt32(out var configured)
+            && configured > 0)
+            return configured;
+        return 900;
+    }
+
+    static string EnsureTrailingSeparator(string path)
+        => Path.EndsInDirectorySeparator(path) ? path : path + Path.DirectorySeparatorChar;
 
     static bool WorkspaceContainsProject(MSBuildWorkspace workspace, string projectPath)
         => workspace.CurrentSolution.Projects.Any(project =>

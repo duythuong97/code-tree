@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path, PurePosixPath
 
 from .graph_package import GraphPackage
@@ -33,44 +33,45 @@ def render_file_tree(package: GraphPackage, output: Path, max_lines: int = 20_00
         elif evidence.get("target_type") == "EDGE":
             edge_evidence[evidence["target_id"]].append(evidence)
     children: dict[str, list[str]] = defaultdict(list)
+    structural_parents: dict[str, set[str]] = defaultdict(set)
     outgoing: dict[str, list[dict[str, str]]] = defaultdict(list)
     for edge in package.edges.values():
         if edge["edge_type"] == "CONTAINS" and edge["graph_layer"] == "STRUCTURAL":
             children[edge["source_node_id"]].append(edge["target_node_id"])
+            structural_parents[edge["target_node_id"]].add(edge["source_node_id"])
         else:
             outgoing[edge["source_node_id"]].append(edge)
-    comments: dict[str, list[dict[str, str]]] = defaultdict(list)
+    evidence_by_source_path: dict[str, set[str]] = defaultdict(set)
+    for evidence in package.evidence.values():
+        if evidence.get("target_type") == "NODE":
+            evidence_by_source_path[evidence.get("source_path", "")].add(
+                evidence.get("target_id", "")
+            )
+    comments_by_source_path: dict[str, list[dict[str, str]]] = defaultdict(list)
     for comment in package.comments.values():
-        comments[comment["owner_node_id"]].append(comment)
+        comments_by_source_path[comment.get("source_path", "")].append(comment)
 
     output.mkdir(parents=True, exist_ok=True)
     output_paths = [
         PurePosixPath(record.relative_path).with_suffix(".md") for record in records
     ]
-    collisions = {path for path in output_paths if output_paths.count(path) > 1}
+    collisions = {path for path, count in Counter(output_paths).items() if count > 1}
     for record, relative_output in zip(records, output_paths):
-        nodes_in_file = {
-            evidence["target_id"]
-            for evidence in package.evidence.values()
-            if evidence.get("target_type") == "NODE" and evidence.get("source_path") == record.relative_path
-        }
+        nodes_in_file = evidence_by_source_path.get(record.relative_path, set())
 
         local_comments = sorted(
-            (comment for comment in package.comments.values() if comment["source_path"] == record.relative_path),
+            comments_by_source_path.get(record.relative_path, ()),
             key=lambda item: (_line(item), item["comment_id"]),
         )
 
         if not nodes_in_file:
             continue
 
-        file_root_nodes = []
-        for node_id in nodes_in_file:
-            is_child = any(
-                node_id in children.get(parent_id, [])
-                for parent_id in nodes_in_file
-            )
-            if not is_child:
-                file_root_nodes.append(node_id)
+        file_root_nodes = [
+            node_id
+            for node_id in nodes_in_file
+            if structural_parents.get(node_id, set()).isdisjoint(nodes_in_file)
+        ]
 
         lines = [f"# File Tree: {record.relative_path}", ""]
         lines.append(
@@ -89,9 +90,7 @@ def render_file_tree(package: GraphPackage, output: Path, max_lines: int = 20_00
                 outgoing,
                 declarations,
                 edge_evidence,
-                comments,
                 frozenset(),
-                record.relative_path,
             )
         if local_comments:
             counts: dict[str, int] = defaultdict(int)
@@ -119,9 +118,7 @@ def _render_node(
     outgoing,
     declarations,
     edge_evidence,
-    comments,
     active,
-    source_path,
 ) -> None:
     if node_id not in package.nodes:
         return
@@ -149,9 +146,7 @@ def _render_node(
             outgoing,
             declarations,
             edge_evidence,
-            comments,
             active,
-            source_path,
         )
     for edge in sorted(
         outgoing.get(node_id, []),
@@ -227,13 +222,6 @@ def _render_fact(lines: list[str], fact, depth: int) -> None:
         lines.append(f"{'  ' * (depth + 1)}- {label}:")
         for child in children:
             _render_fact(lines, child, depth + 2)
-
-
-def _render_comment(lines: list[str], comment: dict[str, str], depth: int) -> None:
-    text = " ".join(comment.get("normalized_text", "").split())
-    lines.append(
-        f"{'  ' * depth}- COMMENT [{comment.get('comment_kind', 'COMMENT')}; L{comment.get('start_line', '?')}]: {text}"
-    )
 
 
 def _line(row: dict[str, str]) -> int:

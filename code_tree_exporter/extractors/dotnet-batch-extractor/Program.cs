@@ -19,7 +19,10 @@ var root = ExtractorRuntime.ConfigPath(config, "root");
 var defaultDatabase = ExtractorRuntime.String(config, "database", FirstFolderDatabase(config));
 var inputRoot = ExtractorRuntime.ConfigPath(config, "inputData");
 var output = ExtractorRuntime.ConfigPath(config, "output");
-var catalog = Catalog.Load(inputRoot);
+var sqlDialect = ExtractorRuntime.String(config, "sqlDialect", "auto").Trim().ToLowerInvariant();
+if (sqlDialect is not ("auto" or "oracle" or "none" or "off"))
+    throw new ArgumentException("sqlDialect must be auto, oracle, or none");
+var catalog = Catalog.Load(inputRoot, defaultDatabase);
 var folderContexts = FolderContexts(config, root, defaultDatabase);
 var mappings = LoadExecutableMappings(Path.Combine(inputRoot, "executable-mappings.csv"));
 var workspaceSnapshot = await DotNetWorkspaceLoader.LoadAsync(config, root);
@@ -73,7 +76,7 @@ foreach (var file in csFiles)
     invocations.AddRange(TopLevelInvocationEdges(file, model, visibleClassNames));
 }
 var commandHandlers = DiscoverCommandHandlers(csFiles, compilationByTree, methodLookup);
-var dataFindings = CollectDataFindings(csFiles, compilationByTree, catalog, folderContexts, defaultDatabase, methodLookup);
+var dataFindings = CollectDataFindings(csFiles, compilationByTree, catalog, folderContexts, defaultDatabase, methodLookup, sqlDialect);
 var executables = DiscoverExecutables(source, scope, repository, defaultDatabase, projects, methods, csFiles, mappings);
 ExpandExecutableProjectReferences(executables, projectsById);
 
@@ -520,11 +523,12 @@ static string EnsureTableReference(PackageBuilder builder, string database, stri
     return nodeId;
 }
 
-static List<DataFinding> CollectDataFindings(List<SourceFile> csFiles, IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilationByTree, Catalog catalog, List<FolderContext> folderContexts, string defaultDatabase, IReadOnlyDictionary<MethodKey, MethodDeclarationInfo> methods)
+static List<DataFinding> CollectDataFindings(List<SourceFile> csFiles, IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilationByTree, Catalog catalog, List<FolderContext> folderContexts, string defaultDatabase, IReadOnlyDictionary<MethodKey, MethodDeclarationInfo> methods, string sqlDialect)
 {
     var findings = new List<DataFinding>();
     foreach (var file in csFiles)
     {
+        if (!ShouldAnalyzeEmbeddedSql(file, sqlDialect)) continue;
         var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
         var database = DatabaseForPath(file.AbsolutePath, folderContexts, defaultDatabase);
         foreach (var expression in ExtractorRuntime.StringExpressions(file, model))
@@ -570,7 +574,8 @@ static List<DataFinding> CollectDataFindings(List<SourceFile> csFiles, IReadOnly
                             ? $"TABLE:{string.Join(':', tableRef.ObjectName.ToUpperInvariant().Split('.', StringSplitOptions.RemoveEmptyEntries).TakeLast(2))}"
                             : $"TABLE:{tableName}");
                     findings.Add(new DataEdgeFinding(owner, unresolvedId, tableRef.EdgeType, tableRef.Operation, file, line, "SQL", snippet, database, tableRef.ObjectName));
-                    findings.Add(new IssueFinding(owner, "TABLE_NOT_IMPORTED", "ERROR", "Table is absent from authoritative catalog", tableName, file, line, database));
+                    if (catalog.IsAuthoritative)
+                        findings.Add(new IssueFinding(owner, "TABLE_NOT_IMPORTED", "ERROR", "Table is absent from authoritative catalog", tableName, file, line, database));
                     continue;
                 }
                 findings.Add(new DataEdgeFinding(owner, ExtractorRuntime.TableId(database, tableName), tableRef.EdgeType, tableRef.Operation, file, line, "SQL", snippet, database));
@@ -587,13 +592,29 @@ static List<DataFinding> CollectDataFindings(List<SourceFile> csFiles, IReadOnly
 static bool IsLikelySql(string text)
 {
     if (string.IsNullOrWhiteSpace(text) || text.Length < 10) return false;
-    var upper = text.ToUpperInvariant();
-    return upper.Contains("SELECT ")
-        || upper.Contains("INSERT ")
-        || upper.Contains("UPDATE ")
-        || upper.Contains("DELETE ")
-        || upper.Contains("MERGE ")
-        || upper.Contains("EXEC ");
+    var sql = text.TrimStart();
+    if (Regex.IsMatch(sql, @"^SELECT\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\b(FROM|INTO)\b", RegexOptions.IgnoreCase);
+    if (Regex.IsMatch(sql, @"^INSERT\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\bINTO\b", RegexOptions.IgnoreCase);
+    if (Regex.IsMatch(sql, @"^UPDATE\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\bSET\b", RegexOptions.IgnoreCase);
+    if (Regex.IsMatch(sql, @"^DELETE\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\bFROM\b", RegexOptions.IgnoreCase);
+    if (Regex.IsMatch(sql, @"^MERGE\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\b(INTO|USING)\b", RegexOptions.IgnoreCase);
+    return Regex.IsMatch(sql, @"^EXEC(?:UTE)?\s+[A-Za-z_][A-Za-z0-9_.$#]*", RegexOptions.IgnoreCase);
+}
+
+static bool ShouldAnalyzeEmbeddedSql(SourceFile file, string configuredDialect)
+{
+    if (configuredDialect is "none" or "off") return false;
+    if (configuredDialect == "oracle") return true;
+    return file.RelativePath.Contains("oracle", StringComparison.OrdinalIgnoreCase)
+        || Regex.IsMatch(
+            file.Text,
+            @"\bOracle(?:Connection|Command|Parameter|DataReader|ManagedDataAccess)\b",
+            RegexOptions.IgnoreCase);
 }
 
 static IEnumerable<MethodKey> EntryMethodsForExecutable(ExecutableInfo executable, List<MethodDeclarationInfo> methods, List<SourceFile> csFiles)

@@ -18,6 +18,9 @@ var systemKey = ExtractorRuntime.String(config, "system", application);
 var root = ExtractorRuntime.ConfigPath(config, "root");
 var output = ExtractorRuntime.ConfigPath(config, "output");
 var inputRoot = ExtractorRuntime.ConfigPath(config, "inputData");
+var sqlDialect = ExtractorRuntime.String(config, "sqlDialect", "auto").Trim().ToLowerInvariant();
+if (sqlDialect is not ("auto" or "oracle" or "none" or "off"))
+    throw new ArgumentException("sqlDialect must be auto, oracle, or none");
 var catalog = Catalog.Load(inputRoot, database);
 var mapperQueries = StringArray(config, "xmlMapperQueries").ToHashSet(StringComparer.Ordinal);
 var workspaceSnapshot = await DotNetWorkspaceLoader.LoadAsync(config, root);
@@ -87,6 +90,7 @@ foreach (var file in csFiles)
     endpoints.AddRange(ExtractorRuntime.Endpoints(file, model));
     endpoints.AddRange(NetFrameworkSupport.ExtractRouteConfig(file, model));
 }
+var apiOperationIds = BuildApiOperationIds(application, endpoints, projects);
 
 var invocationEdges = new List<InvocationInfo>();
 foreach (var file in csFiles)
@@ -101,6 +105,7 @@ var dataAccessClasses = mapperReferences.Select(reference => reference.OwnerClas
 foreach (var file in csFiles)
 {
     var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
+    if (!ShouldAnalyzeEmbeddedSql(file, sqlDialect)) continue;
     foreach (var expression in ExtractorRuntime.StringExpressions(file, model))
     {
         if (string.IsNullOrEmpty(expression.OwnerClassIdentity)) continue;
@@ -200,9 +205,30 @@ foreach (var reference in mapperReferences)
 
 foreach (var endpoint in endpoints)
 {
-    var operationId = ScopedApiOperationId(application, endpoint, projects);
+    var operationId = apiOperationIds[EndpointKey(endpoint)];
     var operationScope = endpoint.File is null ? application : ScopedSourceIdentity(endpoint.File, ProjectForFile(endpoint.File, projects));
-    builder.AddNode(operationId, "API_OPERATION", $"{endpoint.Method} {endpoint.Route}", $"{operationScope}.{endpoint.Method}.{endpoint.Route}", $"{endpoint.Action} API", systemKey, database, repository, properties: new Dictionary<string, object> { ["method"] = endpoint.Method, ["route"] = endpoint.Route, ["endpointStyle"] = endpoint.IsMinimal ? "minimal" : "controller" });
+    var operationQualifiedName = $"{operationScope}.{endpoint.Method}.{endpoint.Route}";
+    if (operationId != ScopedApiOperationId(application, endpoint, projects))
+        operationQualifiedName += $"#{endpoint.File?.RelativePath ?? endpoint.Controller}:{endpoint.Start}";
+    builder.AddNode(
+        operationId,
+        "API_OPERATION",
+        $"{endpoint.Method} {endpoint.Route}",
+        operationQualifiedName,
+        $"{endpoint.Action} API",
+        systemKey,
+        database,
+        repository,
+        properties: new Dictionary<string, object>
+        {
+            ["method"] = endpoint.Method,
+            ["route"] = endpoint.Route,
+            ["controller"] = endpoint.Controller,
+            ["action"] = endpoint.Action,
+            ["routeInferred"] = endpoint.InferredRoute,
+            ["response_type"] = endpoint.ReturnType,
+            ["endpointStyle"] = endpoint.IsMinimal ? "minimal" : "controller",
+        });
     var controllerIdentity = endpoint.File is null || string.IsNullOrEmpty(endpoint.ControllerIdentity)
         ? endpoint.Controller
         : ScopedClassIdentity(endpoint.ControllerIdentity, endpoint.File, ProjectForFile(endpoint.File, projects));
@@ -240,6 +266,7 @@ foreach (var invocation in invocationEdges)
 foreach (var file in csFiles)
 {
     var model = SemanticModelFor(compilationByTree, file.SyntaxTree!);
+    if (!ShouldAnalyzeEmbeddedSql(file, sqlDialect)) continue;
     foreach (var expression in ExtractorRuntime.StringExpressions(file, model))
     {
         var ownerId = SourceMethodNodeId(file, expression.Start, methodNodeIdsByDeclaration);
@@ -289,7 +316,8 @@ foreach (var file in csFiles)
                 target = EnsureTableReference(builder, database, systemKey, repository, tableRef.ObjectName);
                 confidence = 0.5;
                 edgeProperties = new Dictionary<string, object> { ["resolution"] = "deferred_global" };
-                builder.AddIssue("TABLE_NOT_IMPORTED", "ERROR", "Table is absent from authoritative catalog", inlineSqlId, tableName, database, file.RelativePath, line);
+                if (catalog.IsAuthoritative)
+                    builder.AddIssue("TABLE_NOT_IMPORTED", "ERROR", "Table is absent from authoritative catalog", inlineSqlId, tableName, database, file.RelativePath, line);
             }
             else
             {
@@ -303,7 +331,7 @@ foreach (var file in csFiles)
     }
 }
 
-AttachApiSemanticTrees(builder, endpoints, csFiles, methodNodeIdsByDeclaration, application, projects, compilationByTree);
+AttachApiSemanticTrees(builder, endpoints, csFiles, methodNodeIdsByDeclaration, compilationByTree, apiOperationIds);
 AttachMethodSemanticTrees(builder, csFiles, methodNodeIdsByDeclaration, compilationByTree);
 builder.Write(output);
 
@@ -401,7 +429,13 @@ static List<MapperReference> FindMapperReferences(IEnumerable<SourceFile> files,
     return result;
 }
 
-static void AttachApiSemanticTrees(PackageBuilder builder, IEnumerable<EndpointInfo> endpoints, IReadOnlyCollection<SourceFile> files, IReadOnlyDictionary<(SyntaxTree Tree, int Start), string> methodNodeIds, string application, List<ProjectInfo> projects, IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilationByTree)
+static void AttachApiSemanticTrees(
+    PackageBuilder builder,
+    IEnumerable<EndpointInfo> endpoints,
+    IReadOnlyCollection<SourceFile> files,
+    IReadOnlyDictionary<(SyntaxTree Tree, int Start), string> methodNodeIds,
+    IReadOnlyDictionary<SyntaxTree, CSharpCompilation> compilationByTree,
+    IReadOnlyDictionary<string, string> operationIds)
 {
     var filesByTree = files.Where(file => file.SyntaxTree is not null).ToDictionary(file => file.SyntaxTree!);
     foreach (var endpoint in endpoints)
@@ -468,7 +502,7 @@ static void AttachApiSemanticTrees(PackageBuilder builder, IEnumerable<EndpointI
                 _ => new SemanticCallResolution("unresolved", Label: label),
             };
         }
-        var operationId = ScopedApiOperationId(application, endpoint, projects);
+        var operationId = operationIds[EndpointKey(endpoint)];
         builder.SetNodeProperty(operationId, "semantic_tree", SemanticTreeV3.Operation($"{endpoint.Method} {endpoint.Route}", parameters, new[] { body }, semanticFile, ResolveCall));
     }
 }
@@ -693,11 +727,32 @@ static ProjectInfo? ProjectForFile(SourceFile file, List<ProjectInfo> projects)
         .FirstOrDefault();
 }
 
+static bool ShouldAnalyzeEmbeddedSql(SourceFile file, string configuredDialect)
+{
+    if (configuredDialect is "none" or "off") return false;
+    if (configuredDialect == "oracle") return true;
+    return file.RelativePath.Contains("oracle", StringComparison.OrdinalIgnoreCase)
+        || Regex.IsMatch(
+            file.Text,
+            @"\bOracle(?:Connection|Command|Parameter|DataReader|ManagedDataAccess)\b",
+            RegexOptions.IgnoreCase);
+}
+
 static bool IsLikelySql(string text)
 {
     if (string.IsNullOrWhiteSpace(text) || text.Length < 10) return false;
-    var upper = text.ToUpperInvariant();
-    return upper.Contains("SELECT ") || upper.Contains("INSERT ") || upper.Contains("UPDATE ") || upper.Contains("DELETE ") || upper.Contains("MERGE ") || upper.Contains("EXEC ");
+    var sql = text.TrimStart();
+    if (Regex.IsMatch(sql, @"^SELECT\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\b(FROM|INTO)\b", RegexOptions.IgnoreCase);
+    if (Regex.IsMatch(sql, @"^INSERT\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\bINTO\b", RegexOptions.IgnoreCase);
+    if (Regex.IsMatch(sql, @"^UPDATE\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\bSET\b", RegexOptions.IgnoreCase);
+    if (Regex.IsMatch(sql, @"^DELETE\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\bFROM\b", RegexOptions.IgnoreCase);
+    if (Regex.IsMatch(sql, @"^MERGE\b", RegexOptions.IgnoreCase))
+        return Regex.IsMatch(sql, @"\b(INTO|USING)\b", RegexOptions.IgnoreCase);
+    return Regex.IsMatch(sql, @"^EXEC(?:UTE)?\s+[A-Za-z_][A-Za-z0-9_.$#]*", RegexOptions.IgnoreCase);
 }
 
 static void AddConfigurationNodes(PackageBuilder builder, string appId, string root, string repository, string systemKey, string database)
@@ -802,6 +857,38 @@ static string ScopedApiOperationId(string application, EndpointInfo endpoint, Li
     var scope = endpoint.File is null ? application : ScopedSourceIdentity(endpoint.File, ProjectForFile(endpoint.File, projects));
     return ExtractorRuntime.StableNodeId("api-operation", application, scope, endpoint.Method, endpoint.Route);
 }
+
+static Dictionary<string, string> BuildApiOperationIds(
+    string application,
+    IEnumerable<EndpointInfo> endpoints,
+    List<ProjectInfo> projects)
+{
+    var result = new Dictionary<string, string>(StringComparer.Ordinal);
+    foreach (var group in endpoints.GroupBy(endpoint => ScopedApiOperationId(application, endpoint, projects)))
+    {
+        var ordered = group
+            .OrderBy(endpoint => endpoint.File?.RelativePath ?? string.Empty, StringComparer.Ordinal)
+            .ThenBy(endpoint => endpoint.Start)
+            .ThenBy(endpoint => endpoint.HandlerEnd)
+            .ToList();
+        for (var index = 0; index < ordered.Count; index++)
+        {
+            var endpoint = ordered[index];
+            var operationId = index == 0
+                ? group.Key
+                : ExtractorRuntime.StableNodeId(
+                    "api-operation",
+                    application,
+                    group.Key,
+                    EndpointKey(endpoint));
+            result[EndpointKey(endpoint)] = operationId;
+        }
+    }
+    return result;
+}
+
+static string EndpointKey(EndpointInfo endpoint)
+    => $"{endpoint.File?.RelativePath ?? string.Empty}:{endpoint.Start}:{endpoint.HandlerEnd}:{endpoint.Controller}:{endpoint.Action}:{endpoint.Method}:{endpoint.Route}";
 
 static string DeclarationIdentity(SyntaxTree tree, int start)
     => $"{tree.FilePath}:{start.ToString(System.Globalization.CultureInfo.InvariantCulture)}";

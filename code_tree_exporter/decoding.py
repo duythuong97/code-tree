@@ -7,8 +7,17 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-_ENCODING_DECLARATION = re.compile(
-    rb"(?i)(?:coding\s*[:=]|charset\s*=|encoding\s*=)\s*['\"]?([a-z0-9._-]+)"
+_HASH_COMMENT_ENCODING_DECLARATION = re.compile(
+    rb"(?im)^[ \t\f]*#.*?(?:coding|encoding)[ \t]*[:=][ \t]*['\"]?([a-z0-9._-]+)"
+)
+_COMMENT_ENCODING_DECLARATION = re.compile(
+    rb"(?im)^[ \t]*(?://|/\*|\*|--)[ \t]*(?:coding|encoding)[ \t]*[:=][ \t]*['\"]?([a-z0-9._-]+)"
+)
+_XML_ENCODING_DECLARATION = re.compile(
+    rb"(?is)^\s*(?:\xef\xbb\xbf)?<\?xml\b[^>]*\bencoding\s*=\s*['\"]\s*([a-z0-9._-]+)\s*['\"]"
+)
+_HTML_CHARSET_DECLARATION = re.compile(
+    rb"(?is)<meta\b[^>]*\bcharset\s*=\s*['\"]?\s*([a-z0-9._-]+)"
 )
 
 SUPPORTED_ENCODINGS = frozenset({
@@ -116,11 +125,22 @@ def _bom(raw: bytes) -> tuple[str, str]:
     return "", ""
 
 def _declared_in_file(raw: bytes, relative_path: str) -> str:
-    match = _ENCODING_DECLARATION.search(raw[:4096])
+    header = raw[:4096]
+    match = _XML_ENCODING_DECLARATION.search(header)
+    if match is None:
+        match = _HTML_CHARSET_DECLARATION.search(header)
+    if match is None:
+        # Source encodings are conventionally declared in a comment header;
+        # limit scanning to the first two lines to avoid matching identifiers.
+        header_lines = b"\n".join(header.splitlines()[:2])
+        match = _COMMENT_ENCODING_DECLARATION.search(header_lines)
+    if match is None:
+        match = _HASH_COMMENT_ENCODING_DECLARATION.search(header_lines)
     if not match:
         return ""
     try:
-        return canonical_encoding(match.group(1).decode("ascii"))
+        value = match.group(1).decode("ascii")
+        return canonical_encoding(value)
     except (LookupError, ValueError) as exc:
         value = match.group(1).decode("ascii", errors="backslashreplace")
         raise SourceDecodingError(

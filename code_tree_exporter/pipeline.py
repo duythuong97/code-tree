@@ -21,6 +21,10 @@ from .graph_package import (
     replace_directory,
     validate_output_directory,
 )
+from .linker import run_linker
+from .v3.catalog import prepare_catalog
+from .v3.hierarchy import enrich_hierarchy
+from .v3.publisher import publish_v3
 
 _BLOCKED_DIRECTORIES = frozenset(
     {
@@ -67,6 +71,7 @@ def run_pipeline(config_path: Path) -> Path:
     if output_mode not in {"flat", "partitioned"}:
         raise ValueError("outputMode must be 'flat' or 'partitioned'")
     limits = _resolved_limits(config)
+    allow_partial_extraction = config.get("allowPartialExtraction") is True
     graph = GraphPackage()
     for source in validated_sources:
         graph.register_source(
@@ -82,19 +87,11 @@ def run_pipeline(config_path: Path) -> Path:
         prefix=f".{output.name}-staging-", dir=staging_parent
     ) as temporary:
         temporary_root = Path(temporary)
-        from .v3.catalog import prepare_catalog
-
-        configured_input = config.get("inputData")
-        existing_input = (
-            Path(configured_input)
-            if isinstance(configured_input, str) and Path(configured_input).is_dir()
-            else None
-        )
         catalog = prepare_catalog(
             config,
             config_dir=config_path.parent,
             staging_root=temporary_root,
-            existing_input=existing_input,
+            existing_input=_existing_input_root(config),
         )
         if catalog:
             catalog.merge_into(
@@ -129,6 +126,10 @@ def run_pipeline(config_path: Path) -> Path:
                     severity="WARNING",
                     properties={"source_key": source_name},
                 )
+                if not allow_partial_extraction:
+                    raise ValueError(
+                        f"Source {source_name} has no decodable supported files"
+                    )
                 continue
             package_output = packages_root / source_name
             semantic_project = spec.config_type in {
@@ -168,7 +169,14 @@ def run_pipeline(config_path: Path) -> Path:
                 node.get("node_type") == "API_OPERATION"
                 for node in graph.nodes.values()
             )
-            _run_extractor(spec, extractor_config_path, extractor_config, graph)
+            extracted = _run_extractor(
+                spec, extractor_config_path, extractor_config, graph
+            )
+            if not extracted and not allow_partial_extraction:
+                raise ValueError(
+                    f"Extractor failed for source {source_name}; "
+                    "set allowPartialExtraction=true to publish a partial graph"
+                )
             if package_output.exists():
                 graph.merge_directory(package_output)
             if (
@@ -198,9 +206,6 @@ def run_pipeline(config_path: Path) -> Path:
                     graph,
                 )
 
-        from .linker import run_linker
-        from .v3.hierarchy import enrich_hierarchy
-
         run_linker(graph)
         enrich_hierarchy(graph)
         graph.materialize_structure()
@@ -223,8 +228,6 @@ def run_pipeline(config_path: Path) -> Path:
             max_evidence_snippet_chars=limits["maxEvidenceSnippetChars"],
             max_issues_per_type_per_file=limits["maxIssuesPerTypePerFile"],
         )
-        from .v3.publisher import publish_v3
-
         publish_v3(final_staging, catalog=catalog, config=config)
         replace_directory(final_staging, output)
     return output
@@ -254,20 +257,12 @@ def validate_pipeline_config(config_path: Path) -> dict[str, object]:
     if output_mode not in {"flat", "partitioned"}:
         raise ValueError("outputMode must be 'flat' or 'partitioned'")
     limits = _resolved_limits(config)
-    configured_input = config.get("inputData")
-    existing_input = (
-        Path(configured_input)
-        if isinstance(configured_input, str) and Path(configured_input).is_dir()
-        else None
-    )
     with tempfile.TemporaryDirectory(prefix="code-tree-v3-validate-") as temporary:
-        from .v3.catalog import prepare_catalog
-
         catalog = prepare_catalog(
             config,
             config_dir=config_path.parent,
             staging_root=Path(temporary),
-            existing_input=existing_input,
+            existing_input=_existing_input_root(config),
         )
         catalog_summary = {
             "files": len(catalog.files),
@@ -337,6 +332,14 @@ def _load_config(path: Path) -> dict:
     return value
 
 
+def _existing_input_root(config: dict) -> Path | None:
+    configured = config.get("inputData")
+    if not isinstance(configured, str):
+        return None
+    path = Path(configured)
+    return path if path.is_dir() else None
+
+
 def _absolute_directory(config: dict, key: str) -> Path:
     path = _absolute_path(config, key)
     if not path.is_dir():
@@ -382,7 +385,6 @@ def _resolved_limits(config: dict) -> dict[str, int]:
         "maxIssuesPerTypePerFile": value("maxIssuesPerTypePerFile", 20),
         "extractorTimeoutSeconds": value("extractorTimeoutSeconds", 300),
         "projectTimeoutSeconds": value("projectTimeoutSeconds", 900),
-        "maxWorkerProcesses": value("maxWorkerProcesses", 4),
     }
 
 
@@ -879,12 +881,12 @@ def _xml_mapper_queries(root: Path, paths: list[str]) -> list[str]:
 
 def _run_extractor(
     spec: ExtractorSpec, config_path: Path, config: dict, graph: GraphPackage
-) -> None:
+) -> bool:
     if spec.config_type == "xml-sql":
         from .extractors.xml_sql.runner import extract
 
         extract(config)
-        return
+        return True
     env = os.environ.copy()
     command: list[str]
     if spec.config_type == "angular":
@@ -921,7 +923,7 @@ def _run_extractor(
                 f"{spec.config_type} extractor dependency missing: {exc}",
                 properties={"source_key": str(config.get("source") or "")},
             )
-            return
+            return False
         completed = subprocess.CompletedProcess(command, 127, "", str(exc))
     except subprocess.TimeoutExpired:
         graph.add_issue(
@@ -933,7 +935,7 @@ def _run_extractor(
                 "source_key": str(config.get("source") or ""),
             },
         )
-        return
+        return False
     if completed.returncode and spec.config_type == "angular":
         primary_message = _bounded_subprocess_message(
             completed, "Angular TypeScript parser failed"
@@ -964,7 +966,7 @@ def _run_extractor(
                         "source_key": str(config.get("source") or ""),
                     },
                 )
-                return
+                return False
     if completed.returncode:
         message = _bounded_subprocess_message(completed, "Extractor failed")
         graph.add_issue(
@@ -972,6 +974,16 @@ def _run_extractor(
             f"{spec.config_type} extractor failed: {message}",
             properties={"source_key": str(config.get("source") or "")},
         )
+        return False
+    output = Path(str(config.get("output") or ""))
+    if not (output / "manifest.json").is_file():
+        graph.add_issue(
+            "PARSE_ERROR",
+            f"{spec.config_type} extractor completed without a package manifest",
+            properties={"source_key": str(config.get("source") or "")},
+        )
+        return False
+    return True
 
 
 def _bounded_subprocess_message(

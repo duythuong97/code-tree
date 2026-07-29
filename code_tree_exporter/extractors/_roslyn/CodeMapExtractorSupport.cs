@@ -28,7 +28,19 @@ public sealed record SqlAnalysis(
     IReadOnlyList<int> DynamicOffsets,
     IReadOnlyList<int> ParseErrorOffsets,
     bool Recognized);
-public sealed record EndpointInfo(string Controller, string Action, string Method, string Route, int Start, int HandlerStart, int HandlerEnd, bool IsMinimal = false, SourceFile? File = null, string ControllerIdentity = "");
+public sealed record EndpointInfo(
+    string Controller,
+    string Action,
+    string Method,
+    string Route,
+    int Start,
+    int HandlerStart,
+    int HandlerEnd,
+    string ReturnType = "",
+    bool IsMinimal = false,
+    SourceFile? File = null,
+    string ControllerIdentity = "",
+    bool InferredRoute = false);
 public sealed record StringLiteralInfo(string OwnerClass, string Value, int Start, SourceFile File);
 public sealed record StringExpressionInfo(string OwnerClass, string OwnerMember, string Value, int Start, SourceFile File, bool IsDynamic, string ExpressionText, string OwnerClassIdentity = "");
 public sealed record InvocationInfo(string SourceClass, string SourceMember, string TargetClass, string TargetMember, int Start, SourceFile File, string SourceClassIdentity = "", string TargetClassIdentity = "", string TargetIdentity = "");
@@ -267,20 +279,36 @@ public static class ExtractorRuntime
             var controllerIdentity = TypeIdentity(controllerSymbol);
             var controllerName = cls.Identifier.Text;
             var baseRoute = AttributeStringArgument(model, cls.AttributeLists, "Route", controllerName, string.Empty) ?? string.Empty;
+            var area = AttributeStringArgument(model, cls.AttributeLists, "Area") ?? string.Empty;
             foreach (var method in cls.Members.OfType<MethodDeclarationSyntax>())
             {
                 _ = model.GetDeclaredSymbol(method); // Roslyn SemanticModel proof point: action symbol binding.
-                var actionName = method.Identifier.Text;
+                var actionName = AttributeStringArgument(model, method.AttributeLists, "ActionName") ?? method.Identifier.Text;
                 foreach (var attribute in method.AttributeLists.SelectMany(list => list.Attributes))
                 {
                     _ = model.GetSymbolInfo(attribute); // Resolve attribute constructor where references are available.
                     if (!TryHttpVerbFromAttribute(AttributeName(attribute), out var verb)) continue;
                     var suffix = AttributeStringArgument(model, attribute, controllerName, actionName) ?? string.Empty;
-                    var route = CombineRoutes(baseRoute, suffix);
+                    var inferredRoute = string.IsNullOrWhiteSpace(baseRoute) && string.IsNullOrWhiteSpace(suffix);
+                    var route = inferredRoute
+                        ? ConventionalRoute(area, controllerName, actionName)
+                        : CombineRoutes(baseRoute, suffix);
                     route = ApplyRouteTokens(route, controllerName, actionName);
                     var normalized = NormalizeHttpRoute(verb, route);
                     SyntaxNode handler = method.Body ?? (SyntaxNode?)method.ExpressionBody ?? method;
-                    result.Add(new EndpointInfo(controllerName, actionName, normalized.Method, normalized.Route, method.SpanStart, handler.SpanStart, handler.Span.End, File: file, ControllerIdentity: controllerIdentity));
+                    var returnType = model.GetDeclaredSymbol(method)?.ReturnType.ToDisplayString() ?? method.ReturnType.ToString();
+                    result.Add(new EndpointInfo(
+                        controllerName,
+                        actionName,
+                        normalized.Method,
+                        normalized.Route,
+                        method.SpanStart,
+                        handler.SpanStart,
+                        handler.Span.End,
+                        ReturnType: returnType,
+                        File: file,
+                        ControllerIdentity: controllerIdentity,
+                        InferredRoute: inferredRoute));
                 }
             }
         }
@@ -702,6 +730,17 @@ public static class ExtractorRuntime
         return "/" + left + "/" + right;
     }
 
+    static string ConventionalRoute(string area, string controllerName, string actionName)
+    {
+        var controller = controllerName.EndsWith("Controller", StringComparison.Ordinal)
+            ? controllerName[..^"Controller".Length]
+            : controllerName;
+        var segments = new[] { area.Trim('/'), controller, actionName }
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim('/'));
+        return "/" + string.Join('/', segments);
+    }
+
     public static (string Method, string Route) NormalizeHttpRoute(string method, string route)
     {
         var normalizedMethod = (method ?? string.Empty).Trim().ToUpperInvariant();
@@ -830,12 +869,14 @@ public static class MsBuildProjectXml
 public sealed class Catalog
 {
     readonly Dictionary<string, Dictionary<string, HashSet<string>>> _tables = new(StringComparer.OrdinalIgnoreCase);
+    public bool IsAuthoritative { get; private set; }
 
     public static Catalog Load(string inputRoot, string database = "")
     {
         var catalog = new Catalog();
         var path = Path.Combine(inputRoot, "tables.csv");
         if (!File.Exists(path)) return catalog;
+        catalog.IsAuthoritative = true;
         foreach (var row in Csv.Read(path))
         {
             var db = ExtractorRuntime.OracleIdentifier(row["database"]);

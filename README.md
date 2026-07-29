@@ -12,9 +12,9 @@ không phải parse/link source lần nữa.
 
 V3 bổ sung catalog auto-import, hierarchy từ system xuống database/application,
 input/output, materialized flow, resolution candidates và quality metrics mà
-không đổi stable/numeric ID của graph V2. Plan đầy đủ nằm tại
-[`docs/V3_PLAN.md`](docs/V3_PLAN.md); config và bốn CSV bootstrap nằm trong
-[`examples/v3`](examples/v3).
+không đổi stable/numeric ID của graph V2. Config chạy mẫu là
+[`demo-config.json`](demo-config.json); bốn CSV bootstrap nằm trong
+[`examples/v3/catalog`](examples/v3/catalog).
 
 ## V3 bootstrap
 
@@ -32,18 +32,14 @@ Thêm vào config:
 ```json
 {
   "catalog": {
-    "folder": "./catalog",
-    "autoImport": true,
-    "strict": true,
-    "duplicatePolicy": "error"
-  },
-  "enrichment": {
-    "flowMaxDepth": 8,
-    "maxFlowTargetsPerEntry": 100,
-    "minimumResolutionConfidence": 0.85
+    "folder": "${CODE_TREE_CATALOG}",
+    "strict": true
   }
 }
 ```
+
+`autoImport=true`, `duplicatePolicy=error`, `encoding=auto` và giới hạn flow đã
+có default; chỉ khai báo khi cần override.
 
 Mỗi CSV có structure khác phải có JSON profile trong `catalog/profiles`. Profile
 map header nguồn sang schema chuẩn và có thể compile thành `jobnet.csv`,
@@ -54,67 +50,46 @@ map header nguồn sang schema chuẩn và có thể compile thành `jobnet.csv`
 ```json
 {
   "name": "order-system",
-  "root": "${SOURCE_ROOT}",
-  "output": "${EXPORT_OUTPUT}",
-  "defaultEncoding": "auto",
-  "inputData": "${CATALOG_DATA}",
-  "outputMode": "partitioned",
-  "combinedProjection": false,
-  "knowledgeChunking": {
-    "enabled": true,
-    "maxMarkdownBytes": 1048576,
-    "splitBy": ["source", "nodeType"]
-  },
-  "limits": {
-    "maxTreeLines": 20000,
-    "maxFileBytes": 10485760,
-    "maxEvidenceSnippetChars": 500,
-    "maxIssuesPerTypePerFile": 20,
-    "extractorTimeoutSeconds": 300,
-    "projectTimeoutSeconds": 900,
-    "maxWorkerProcesses": 4
+  "root": "${CODE_MAP_DEMO_ROOT}",
+  "output": "${CODE_TREE_OUTPUT}",
+  "inputData": "${CODE_MAP_INPUT_DATA}",
+  "catalog": {
+    "folder": "${CODE_TREE_CATALOG}",
+    "strict": true
   },
   "sources": [
-    { "name": "order-ui", "type": "angular", "folders": ["ui"] },
     {
       "name": "order-api",
-      "type": "dotnet",
+      "type": "dotnet-api",
+      "system": "order-system",
+      "repository": "order-api",
       "folders": ["api"],
-      "database": "ORDERDB"
-    },
-    {
-      "name": "order-db",
-      "type": "oracle-plsql",
-      "folders": ["db/plsql"],
-      "database": "ORDERDB",
-      "semanticDetail": "summary",
-      "encoding": "cp932"
-    },
-    {
-      "name": "order-sql",
-      "type": "sql-files",
-      "folders": ["db/sql"],
-      "database": "ORDERDB",
-      "encoding": "cp932"
-    },
-    {
-      "name": "order-loader",
-      "type": "sql-loader",
-      "folders": ["db/loader"],
-      "database": "ORDERDB",
-      "encoding": "shift_jis"
-    },
-    {
-      "name": "order-mappers",
-      "type": "xml-sql",
-      "folders": ["db/mappers"],
-      "database": "ORDERDB"
+      "database": "DB1",
+      "schema": "APP",
+      "sqlDialect": "auto"
     }
   ]
 }
 ```
 
-`root`, `output`, `inputData` nhận đường dẫn tuyệt đối hoặc tương đối với file config. Dùng đường dẫn tương đối hoặc biến môi trường để cùng một config chạy trên máy khác. `inputData` có thể bỏ nếu không có catalog, nhưng phải nằm ngoài `output` và `output.previous` để rerun không xóa input. `folders` là đường dẫn tương đối; chấp nhận cả `/` và `\\`, nhưng `/` được khuyến nghị cho macOS/Windows. Với `.NET`, `folders` có thể trỏ thẳng tới `.cs`, `.csproj`, `.sln`; pipeline tự stage project/solution reference closure. XML mapper có `mapper namespace` và statement SQL trong cùng source `.NET` được đọc tự động; XML cấu hình thông thường bị bỏ qua an toàn.
+`root`, `output`, `inputData` và `catalog.folder` nhận đường dẫn tuyệt đối hoặc
+tương đối với file config. `inputData` chỉ cần cho file legacy chưa chuyển sang
+catalog profile. Mọi input phải nằm ngoài `output` và `output.previous`.
+`folders` là đường dẫn tương đối; `/` được khuyến nghị. Với `.NET`, `folders`
+có thể trỏ tới `.cs`, `.csproj`, `.sln`; pipeline tự stage project/solution
+reference closure. XML mapper trong cùng source `.NET` được đọc tự động.
+`sqlDialect` của `dotnet-api`/`dotnet-batch` nhận `auto`, `oracle` hoặc `none`.
+`auto` chỉ parse embedded SQL khi file có dấu hiệu dùng Oracle; đặt `oracle`
+khi source dùng SQL Oracle qua wrapper nội bộ, và `none` để tắt hoàn toàn.
+
+Mặc định `allowPartialExtraction=false`: nếu một extractor lỗi, pipeline không
+publish graph mới và output hợp lệ trước đó vẫn được giữ. Chỉ đặt
+`allowPartialExtraction=true` khi chấp nhận graph thiếu source và các issue đi
+kèm.
+
+Output local nên đặt dưới `.artifacts/code-tree/<tên-lần-chạy>` thay vì tạo các
+thư mục `output-*` ở repository root. `.env.example` đã dùng
+`.artifacts/code-tree/demo`; toàn bộ `.artifacts/` được Git bỏ qua.
 
 `outputMode` vẫn được giữ để tương thích config cũ. Graph luôn nằm trong một
 `graph.sqlite`; logical source partition được lưu bằng `package_key` như
@@ -128,14 +103,24 @@ expression và call arguments bị lược bỏ khỏi semantic tree. Dùng
 `combinedProjection`, `knowledgeChunking` và `maxTreeLines` được lưu vào
 metadata SQLite làm mặc định cho bước export Markdown. `maxTreeLines` chỉ giới
 hạn projection Markdown; `maxFileBytes` ghi
-`FILE_TOO_LARGE` và bỏ riêng file đó; timeout chỉ làm hỏng extractor/source đang
-chạy, không xóa graph của source khác.
+`FILE_TOO_LARGE` và bỏ riêng file đó. `extractorTimeoutSeconds` giới hạn toàn bộ
+worker; `projectTimeoutSeconds` giới hạn từng lần Roslyn mở solution/project.
 
-Runtime tùy extractor: Python 3.10+, Node.js + TypeScript cho Angular, .NET SDK 9 cho Roslyn. Có thể chỉ định executable không nằm trong `PATH` bằng `CODE_TREE_NODE` và `CODE_TREE_DOTNET`. Thiếu Node.js/TypeScript hoặc primary parser lỗi, Angular dùng Python fallback, đồng thời ghi `SEMANTIC_TREE_UNAVAILABLE`; fallback không bảo toàn đầy đủ nested behavior.
+Runtime tùy extractor: Python 3.10+, Node.js + TypeScript cho Angular, .NET SDK
+9+ cho Roslyn. Có thể chỉ định executable không nằm trong `PATH` bằng
+`CODE_TREE_NODE` và `CODE_TREE_DOTNET`. Runner tự suy ra `DOTNET_ROOT`, host
+path, SDK resolver và runtime roll-forward từ executable đã chọn. Thiếu
+Node.js/TypeScript hoặc primary parser lỗi, Angular dùng Python fallback, đồng
+thời ghi `SEMANTIC_TREE_UNAVAILABLE`; fallback không bảo toàn đầy đủ nested
+behavior.
 
 Sao chép `.env.example` thành `.env` trên mỗi máy rồi sửa path. CLI tự đọc `.env` cạnh file config; nếu không có thì đọc `.env` tại thư mục chạy. Biến đã export trong process có ưu tiên cao hơn `.env`. `.env` bị Git bỏ qua; chỉ `.env.example` được commit để liệt kê cấu hình cần thiết.
 
-`defaultEncoding: "auto"` nhận diện theo thứ tự: BOM, khai báo `coding`/`charset`/`encoding` trong file, UTF-8 strict, UTF-16 heuristic, rồi CP932/EUC-JP strict. Kết quả legacy mơ hồ tạo `ENCODING_CONFLICT`; không dùng ký tự replacement nên không âm thầm làm hỏng tiếng Nhật. `encoding` và `encodingOverrides` vẫn dùng để khóa encoding cho source/file đặc biệt.
+`defaultEncoding: "auto"` nhận diện theo thứ tự: BOM, khai báo encoding ở header
+Python/XML/HTML hoặc comment header, UTF-8 strict, UTF-16 heuristic, rồi
+CP932/EUC-JP strict. Kết quả legacy mơ hồ tạo `ENCODING_CONFLICT`; không dùng ký
+tự replacement nên không âm thầm làm hỏng tiếng Nhật. `encoding` và
+`encodingOverrides` vẫn dùng để khóa encoding cho source/file đặc biệt.
 
 ## Cài đặt
 
@@ -148,13 +133,11 @@ config dùng Angular hoặc .NET. Extractor `.NET` dùng `MSBuildWorkspace`, nê
 SDK mà `global.json`/project yêu cầu cũng phải có trên máy. Nếu workspace không
 load được project, extractor ghi `MSBUILD_WORKSPACE_DIAGNOSTIC` và chỉ dùng
 fallback compilation cho các file bị ảnh hưởng. Lần chạy đầu build worker
-Release; các lần sau chạy DLL trực tiếp nếu source worker không đổi. Trên
-Windows, có thể đặt
-`CODE_TREE_WINDOWS_WORKER` tới executable, Python script hoặc .NET DLL dùng
-Visual Studio Build Tools/MSBuildWorkspace; nếu không đặt, .NET Framework chạy
-syntax/config best effort. Nếu TypeScript semantic runtime không load được,
-Angular dùng fallback chỉ giữ declaration/literal với confidence tối đa `0.5`
-và ghi `SEMANTIC_TREE_UNAVAILABLE`.
+Release; các lần sau chạy DLL trực tiếp nếu source worker không đổi. Runner tự
+cấu hình môi trường .NET từ `CODE_TREE_DOTNET` hoặc executable trong `PATH`. Nếu
+TypeScript semantic runtime không load được, Angular dùng fallback chỉ giữ
+declaration/literal với confidence tối đa `0.5` và ghi
+`SEMANTIC_TREE_UNAVAILABLE`.
 
 ## Chạy
 
@@ -201,13 +184,13 @@ Chạy trực tiếp từ source:
 
 ```text
 python3 -m code_tree_exporter.markdown_export --database <dist>
-python3 scripts/export_markdown.py --database <dist>
 ```
 
 ## Query knowledge
 
-Sau khi generate output, query layer đọc manifest/index và query trực tiếp
-`graph.sqlite` qua các index SQLite:
+Sau khi generate output, query layer đọc manifest và query trực tiếp
+`graph.sqlite` qua các index SQLite. `graph-index.json` chỉ được nạp lazy khi
+cần locator của codebase memory:
 
 ```text
 code-tree-query --output <dist> find-node --qualified-name <name>
@@ -228,7 +211,9 @@ code-tree-query --output <dist> trace-flow --node-id <node-id>
 
 Chạy trực tiếp từ source bằng
 `python -m code_tree_exporter.query --output <dist> ...`. Response là JSON ngắn
-gồm answer, graph IDs, evidence, source location, confidence và issues.
+gồm answer, graph IDs, evidence, source location, confidence và issues. Trace
+được chặn ở 5.000 node, 10.000 edge và 5.000 evidence; kiểm tra
+`data.truncated` và dùng `graph.sqlite` khi cần duyệt toàn bộ graph rất lớn.
 
 ## Cấu trúc source
 

@@ -87,9 +87,7 @@ namespace CodeMap.Extractors
                                 invocation.SpanStart,
                                 invocation.SpanStart,
                                 invocation.Span.End,
-                                false,
-                                file,
-                                ""
+                                File: file
                             ));
                         }
                     }

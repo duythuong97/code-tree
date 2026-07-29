@@ -3,53 +3,57 @@
   "root": "${CODE_MAP_DEMO_ROOT}",
   "output": "${CODE_TREE_OUTPUT}",
   "inputData": "${CODE_MAP_INPUT_DATA}",
-  "defaultEncoding": "auto",
-  "outputMode": "partitioned",
-  "limits": {
-    "maxCsvRows": 1000000,
-    "maxCsvBytes": 8388608,
-    "maxTreeLines": 20000,
-    "maxFileBytes": 10485760,
-    "maxEvidenceSnippetChars": 500,
-    "maxIssuesPerTypePerFile": 20,
-    "extractorTimeoutSeconds": 300,
-    "projectTimeoutSeconds": 900,
-    "maxWorkerProcesses": 4
+  "catalog": {
+    "folder": "${CODE_TREE_CATALOG}",
+    "strict": true
   },
   "sources": [
     {
       "name": "customer-web",
       "type": "angular",
+      "system": "code-map-demo",
+      "repository": "customer-web",
       "folders": ["customer-web/src/app"],
       "appConfig": "customer-web/src/assets/appconfig.json"
     },
     {
       "name": "order-api",
       "type": "dotnet-api",
+      "system": "code-map-demo",
+      "repository": "order-api",
       "folders": ["order-api"],
-      "database": "ORDER_DB"
+      "database": "DB1",
+      "schema": "APP",
+      "sqlDialect": "oracle"
     },
     {
       "name": "order-fulfillment",
       "type": "dotnet-batch",
+      "system": "code-map-demo",
+      "repository": "order-fulfillment",
       "folders": ["order-fulfillment"],
-      "database": "ORDER_DB"
+      "database": "DB1",
+      "schema": "APP",
+      "sqlDialect": "oracle"
     },
     {
       "name": "order-db",
       "type": "oracle-plsql",
+      "system": "code-map-demo",
+      "repository": "order-db",
       "folders": ["order-db"],
-      "system": "order-db",
-      "database": "ORDER_DB",
-      "schema": "ORDER_APP",
+      "database": "DB1",
+      "schema": "APP",
       "localRoutines": ["VALIDATE_LINES"]
     },
     {
       "name": "order-ops",
       "type": "sql-files",
+      "system": "code-map-demo",
+      "repository": "order-ops",
       "folders": ["order-ops"],
-      "system": "order-ops",
-      "database": "ORDER_DB"
+      "database": "DB1",
+      "schema": "APP"
     }
   ]
 }
