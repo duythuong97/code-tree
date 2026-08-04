@@ -1532,6 +1532,8 @@ def _write_codebase_memory(
     memory_refs: dict[str, dict[str, object]] = {}
     entity_files: list[str] = []
     for group, records in entity_groups.items():
+        if not records:
+            continue
         relative = f"entities/{group}.jsonl"
         entity_files.append(relative)
         with (memory_dir / relative).open("w", encoding="utf-8") as handle:
@@ -1550,6 +1552,8 @@ def _write_codebase_memory(
     )
     relationship_files: list[str] = []
     for group, records in relationship_groups.items():
+        if not records:
+            continue
         relative = f"relationships/{group}.jsonl"
         relationship_files.append(relative)
         with (memory_dir / relative).open("w", encoding="utf-8") as handle:
