@@ -1,0 +1,5 @@
+dist/
+dist-test/
+out/
+node_modules/
+*.vsix

@@ -1,0 +1,449 @@
+{
+  "name": "devflow-agent",
+  "displayName": "DevFlow Agent (Requirement → Solution → Code → Test)",
+  "description": "AI agents, skills and tools for GitHub Copilot: read Excel requirements, analyze impact, write solutions, fill Excel test case templates and maintain regression suites. No MCP required.",
+  "version": "0.1.0",
+  "publisher": "devflow",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.99.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "extensionDependencies": [
+    "github.copilot-chat"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "devflow.init",
+        "title": "DevFlow: Initialize workspace (config, agents, skills)"
+      },
+      {
+        "command": "devflow.openConfig",
+        "title": "DevFlow: Open config"
+      },
+      {
+        "command": "devflow.listAgents",
+        "title": "DevFlow: List agents and skills"
+      }
+    ],
+    "configuration": {
+      "title": "DevFlow Agent",
+      "properties": {
+        "devflow.configPath": {
+          "type": "string",
+          "default": ".devflow/config.json",
+          "description": "Path (relative to workspace root) of the DevFlow config file."
+        },
+        "devflow.maxToolRounds": {
+          "type": "number",
+          "default": 25,
+          "description": "Maximum number of tool-calling rounds per chat request."
+        }
+      }
+    },
+    "chatParticipants": [
+      {
+        "id": "devflow.agent",
+        "name": "devflow",
+        "fullName": "DevFlow",
+        "description": "Requirement → Impact → Solution → Code → Test case → Regression",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "analyze",
+            "description": "Requirement Analyst: đọc file requirement Excel (Requirement/ASIS/TOBE/QA)"
+          },
+          {
+            "name": "impact",
+            "description": "Impact Analyzer: tìm màn hình, code, DB, batch bị ảnh hưởng"
+          },
+          {
+            "name": "solution",
+            "description": "Solution Designer: viết tài liệu solution + impact area"
+          },
+          {
+            "name": "code",
+            "description": "Developer: hiện thực solution đã duyệt"
+          },
+          {
+            "name": "testcase",
+            "description": "Test Designer: viết test case và điền vào template Excel"
+          },
+          {
+            "name": "regression",
+            "description": "Regression Manager: chọn regression test cần chạy, bổ sung case mới"
+          },
+          {
+            "name": "review",
+            "description": "Reviewer: traceability Requirement ↔ Code ↔ Test, tìm chỗ thiếu"
+          }
+        ]
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "devflow_readRequirement",
+        "toolReferenceName": "readRequirement",
+        "displayName": "DevFlow: Read requirement Excel",
+        "userDescription": "Đọc file requirement Excel (sheet Requirement, ASIS, TOBE, QA).",
+        "modelDescription": "Read a requirement Excel workbook and return the content of the Requirement, ASIS, TOBE and QA sheets as Markdown tables with Excel row numbers. Always call this first when the user gives a requirement file.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string", "description": "Path to the .xlsx file (absolute or relative to workspace root)." },
+            "maxRowsPerSheet": { "type": "number", "description": "Max rows to return per sheet (default 300)." }
+          },
+          "required": ["path"]
+        }
+      },
+      {
+        "name": "devflow_readExcel",
+        "toolReferenceName": "readExcel",
+        "displayName": "DevFlow: Read Excel",
+        "userDescription": "Đọc bất kỳ file Excel nào thành bảng Markdown.",
+        "modelDescription": "Read any .xlsx workbook and return chosen sheets as Markdown tables (with Excel column letters and row numbers). Use for screen specs, existing test cases or other Excel documents.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string", "description": "Path to the .xlsx file." },
+            "sheets": { "type": "array", "items": { "type": "string" }, "description": "Sheet names to read. Omit to read all sheets." },
+            "maxRows": { "type": "number", "description": "Max rows per sheet (default 300)." }
+          },
+          "required": ["path"]
+        }
+      },
+      {
+        "name": "devflow_appendQaQuestions",
+        "toolReferenceName": "appendQaQuestions",
+        "displayName": "DevFlow: Add QA questions",
+        "userDescription": "Ghi các câu hỏi chưa rõ vào sheet QA của file requirement (lưu ra bản copy).",
+        "modelDescription": "Append open questions to the QA sheet of a requirement workbook. Writes to a copy (<name>.qa-updated.xlsx) unless outputPath is given. Each question object uses the field names configured in config.requirement.qa.columns (default: no, screenId, category, question, raisedBy, status).",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string", "description": "Requirement .xlsx path." },
+            "outputPath": { "type": "string", "description": "Optional output path. Default: <name>.qa-updated.xlsx next to the original." },
+            "questions": {
+              "type": "array",
+              "items": { "type": "object", "additionalProperties": true },
+              "description": "Questions, e.g. {\"screenId\":\"SCR001\",\"category\":\"Spec\",\"question\":\"...\"}."
+            }
+          },
+          "required": ["path", "questions"]
+        }
+      },
+      {
+        "name": "devflow_findScreens",
+        "toolReferenceName": "findScreens",
+        "displayName": "DevFlow: Find screens",
+        "userDescription": "Tra cứu màn hình ↔ code ↔ spec ↔ regression theo mã, đường dẫn code hoặc từ khoá.",
+        "modelDescription": "Look up the screen index. Find screens by screenId, by a source code path (which screens use this file), or by keyword in name/description. Returns screen id, name, spec path, code globs, regression file and related screens. Use it to map requirements and code changes to screens.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "screenId": { "type": "string" },
+            "codePath": { "type": "string", "description": "Workspace-relative path of a source file." },
+            "keyword": { "type": "string" }
+          }
+        }
+      },
+      {
+        "name": "devflow_getScreenSpec",
+        "toolReferenceName": "getScreenSpec",
+        "displayName": "DevFlow: Get screen spec",
+        "userDescription": "Lấy specification của một màn hình theo mã.",
+        "modelDescription": "Return the specification document of a screen by its screen id (Markdown or Excel converted to Markdown).",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "screenId": { "type": "string" },
+            "maxRows": { "type": "number", "description": "For Excel specs: max rows per sheet (default 400)." }
+          },
+          "required": ["screenId"]
+        }
+      },
+      {
+        "name": "devflow_getRegressionTests",
+        "toolReferenceName": "getRegressionTests",
+        "displayName": "DevFlow: Get regression tests",
+        "userDescription": "Lấy danh sách regression test case hiện có của màn hình.",
+        "modelDescription": "Return existing regression test cases of a screen (from its regression workbook) as a Markdown table, optionally filtered by keyword. Use before proposing new regression cases to avoid duplicates.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "screenId": { "type": "string" },
+            "keyword": { "type": "string", "description": "Optional keyword filter (case-insensitive, any column)." }
+          },
+          "required": ["screenId"]
+        }
+      },
+      {
+        "name": "devflow_describeTestcaseTemplate",
+        "toolReferenceName": "describeTestcaseTemplate",
+        "displayName": "DevFlow: Describe test case template",
+        "userDescription": "Mô tả các field, header, giá trị cho phép của template test case.",
+        "modelDescription": "Describe the test case template (kind=testcase) or a screen's regression workbook (kind=regression): field names you must use in case objects, the Excel header of each column, required fields, allowed values (from config and dropdown validations) and the ID format. Call this before writing test cases.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "kind": { "type": "string", "enum": ["testcase", "regression"] },
+            "screenId": { "type": "string", "description": "Required when kind=regression." }
+          },
+          "required": ["kind"]
+        }
+      },
+      {
+        "name": "devflow_writeTestcases",
+        "toolReferenceName": "writeTestcases",
+        "displayName": "DevFlow: Write test cases to Excel",
+        "userDescription": "Điền test case vào file Excel tạo từ template (giữ nguyên format).",
+        "modelDescription": "Write test cases into an Excel file created from the configured template (format, styles and dropdowns are copied from the template). If outputPath already exists, cases are appended. Each case is an object keyed by the field names returned by devflow_describeTestcaseTemplate; 'steps' may be an array of strings. IDs are generated automatically when omitted. Validate afterwards with devflow_validateTestcases.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "outputPath": { "type": "string", "description": "Output .xlsx. Default: <workDir>/<ticket>/testcases_<ticket>.xlsx" },
+            "ticket": { "type": "string" },
+            "screenId": { "type": "string", "description": "Used for ID generation and as default screenId of cases." },
+            "cases": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+          },
+          "required": ["cases"]
+        }
+      },
+      {
+        "name": "devflow_appendRegressionTests",
+        "toolReferenceName": "appendRegressionTests",
+        "displayName": "DevFlow: Append regression tests",
+        "userDescription": "Bổ sung regression test case mới vào bộ regression của màn hình (có backup).",
+        "modelDescription": "Append new regression test cases to a screen's regression workbook. A backup copy is saved under <workDir>/_backup first. IDs continue from the last existing ID. Cases are objects keyed by the regression field names (see devflow_describeTestcaseTemplate kind=regression). Rejects cases whose title duplicates an existing one.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "screenId": { "type": "string" },
+            "ticket": { "type": "string" },
+            "cases": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+            "outputPath": { "type": "string", "description": "Optional: write to another file instead of updating in place." }
+          },
+          "required": ["screenId", "cases"]
+        }
+      },
+      {
+        "name": "devflow_validateTestcases",
+        "toolReferenceName": "validateTestcases",
+        "displayName": "DevFlow: Validate test case file",
+        "userDescription": "Kiểm tra file test case: field bắt buộc, giá trị dropdown, ID trùng.",
+        "modelDescription": "Validate a test case workbook against the mapping: required fields, allowed values, duplicate IDs. Returns a list of issues with row numbers.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "kind": { "type": "string", "enum": ["testcase", "regression"] }
+          },
+          "required": ["path"]
+        }
+      },
+      {
+        "name": "devflow_searchCode",
+        "toolReferenceName": "searchCode",
+        "displayName": "DevFlow: Search code",
+        "userDescription": "Tìm kiếm text/regex trong source code.",
+        "modelDescription": "Search workspace files for a text or regular expression. Returns file:line matches. Use to find where a screen, field, table, API or message is used for impact analysis.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string" },
+            "isRegex": { "type": "boolean" },
+            "include": { "type": "string", "description": "Glob of files to search, e.g. src/**/*.java" },
+            "maxResults": { "type": "number", "description": "Default 200." }
+          },
+          "required": ["query"]
+        }
+      },
+      {
+        "name": "devflow_listFiles",
+        "toolReferenceName": "listFiles",
+        "displayName": "DevFlow: List files",
+        "userDescription": "Liệt kê file theo glob.",
+        "modelDescription": "List workspace files matching a glob pattern.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "glob": { "type": "string", "description": "e.g. src/**/customer/**" },
+            "max": { "type": "number", "description": "Default 300." }
+          },
+          "required": ["glob"]
+        }
+      },
+      {
+        "name": "devflow_readFile",
+        "toolReferenceName": "readFile",
+        "displayName": "DevFlow: Read file",
+        "userDescription": "Đọc file text (có số dòng).",
+        "modelDescription": "Read a text file with line numbers, optionally a line range. For .xlsx use devflow_readExcel instead.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "startLine": { "type": "number" },
+            "endLine": { "type": "number" }
+          },
+          "required": ["path"]
+        }
+      },
+      {
+        "name": "devflow_gitDiff",
+        "toolReferenceName": "gitDiff",
+        "displayName": "DevFlow: Git diff",
+        "userDescription": "Xem thay đổi code (git diff).",
+        "modelDescription": "Return git diff of the workspace. base: compare against a branch/commit (e.g. origin/main); staged: only staged changes; stat: summary only; paths: limit to paths.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "base": { "type": "string" },
+            "staged": { "type": "boolean" },
+            "stat": { "type": "boolean" },
+            "paths": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      },
+      {
+        "name": "devflow_writeWorkFile",
+        "toolReferenceName": "writeWorkFile",
+        "displayName": "DevFlow: Save work file",
+        "userDescription": "Lưu kết quả phân tích/solution vào thư mục work/<ticket>.",
+        "modelDescription": "Save a Markdown/text deliverable for a ticket under <workDir>/<ticket>/<name> (e.g. 01_analysis.md, 02_impact.md, 03_solution.md). Overwrites the file.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "ticket": { "type": "string" },
+            "name": { "type": "string" },
+            "content": { "type": "string" }
+          },
+          "required": ["ticket", "name", "content"]
+        }
+      },
+      {
+        "name": "devflow_readWorkFile",
+        "toolReferenceName": "readWorkFile",
+        "displayName": "DevFlow: Read work file",
+        "userDescription": "Đọc kết quả các bước trước của ticket.",
+        "modelDescription": "Read a deliverable from <workDir>/<ticket>/<name>. Omit name to list the files of the ticket. Use it to pick up the output of previous agents (analysis, impact, solution).",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "ticket": { "type": "string" },
+            "name": { "type": "string" }
+          },
+          "required": ["ticket"]
+        }
+      },
+      {
+        "name": "devflow_createFile",
+        "toolReferenceName": "createFile",
+        "displayName": "DevFlow: Create file",
+        "userDescription": "Tạo file mới trong workspace (cần xác nhận).",
+        "modelDescription": "Create a new text file in the workspace. Fails if the file exists (use devflow_replaceInFile to edit).",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "content": { "type": "string" }
+          },
+          "required": ["path", "content"]
+        }
+      },
+      {
+        "name": "devflow_replaceInFile",
+        "toolReferenceName": "replaceInFile",
+        "displayName": "DevFlow: Edit file",
+        "userDescription": "Sửa file: thay đoạn text cũ bằng text mới (cần xác nhận).",
+        "modelDescription": "Edit a workspace text file by replacing an exact snippet (oldText must occur exactly once; include enough surrounding lines) with newText. Read the file first.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "oldText": { "type": "string" },
+            "newText": { "type": "string" }
+          },
+          "required": ["path", "oldText", "newText"]
+        }
+      },
+      {
+        "name": "devflow_loadSkill",
+        "toolReferenceName": "loadSkill",
+        "displayName": "DevFlow: Load skill",
+        "userDescription": "Nạp hướng dẫn chi tiết của một skill.",
+        "modelDescription": "Load the full instructions of a DevFlow skill by name (e.g. testcase-writing, impact-analysis). Call it when a task matches a skill listed in your instructions and it is not already loaded.",
+        "canBeReferencedInPrompt": true,
+        "tags": ["devflow"],
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" }
+          },
+          "required": ["name"]
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node esbuild.mjs --test && node --test dist-test/*.test.js",
+    "package": "npm run build && vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "~1.99.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  }
+}
